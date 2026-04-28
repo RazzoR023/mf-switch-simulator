@@ -392,14 +392,15 @@ def parse_zerodha(uploaded) -> pd.DataFrame | None:
     # ── Zerodha CSV tradebook (exact columns) ────────────────────────────────
     if {"symbol", "trade_date", "quantity", "price", "trade_type"}.issubset(cols):
         df = df.rename(columns={"symbol": "scheme_name", "trade_date": "date"})
-        df["date"]   = pd.to_datetime(df["date"], errors="coerce")
-        df["units"]  = pd.to_numeric(df["quantity"], errors="coerce")
-        df["nav"]    = pd.to_numeric(df["price"],    errors="coerce")
-        df["amount"] = df["units"] * df["nav"]
+        df["date"]      = pd.to_datetime(df["date"], errors="coerce")
+        df["units"]     = pd.to_numeric(df["quantity"], errors="coerce").abs()
+        df["nav"]       = pd.to_numeric(df["price"],    errors="coerce")
+        df["amount"]    = df["units"] * df["nav"]
+        df["direction"] = df["trade_type"].astype(str).str.lower().str.strip()
         df = df.dropna(subset=["date", "amount"])
-        out = df[df["trade_type"].astype(str).str.lower() == "buy"]
+        out = df[df["direction"].isin(["buy", "sell"])]
         if out.empty:
-            st.warning("No buy transactions found — showing all rows.")
+            st.warning("No buy/sell transactions found — showing all rows.")
             out = df
         return out.reset_index(drop=True)
 
@@ -428,12 +429,30 @@ def parse_zerodha(uploaded) -> pd.DataFrame | None:
     df["amount"] = pd.to_numeric(df["amount"],   errors="coerce")
     df = df.dropna(subset=["date", "amount"])
 
+    buy_kw  = ["purchase", "buy", "sip", "lumpsum", "invest", "switch in"]
+    sell_kw = ["redeem", "redemption", "sell", "switch out", "withdraw"]
+
     if "txn_type" in df.columns:
-        kw   = ["purchase", "buy", "sip", "lumpsum", "invest", "switch in"]
-        mask = df["txn_type"].astype(str).str.lower().str.contains("|".join(kw), na=False)
-        out  = df[mask] if not df[mask].empty else df[df["amount"] > 0]
+        txn = df["txn_type"].astype(str).str.lower()
+        is_buy  = txn.str.contains("|".join(buy_kw),  na=False)
+        is_sell = txn.str.contains("|".join(sell_kw), na=False)
+        df["direction"] = pd.Series([None] * len(df), index=df.index, dtype=object)
+        df.loc[is_buy,  "direction"] = "buy"
+        df.loc[is_sell, "direction"] = "sell"
+        # Unknown txn_type → infer from amount sign
+        unknown = df["direction"].isna()
+        df.loc[unknown & (df["amount"] < 0), "direction"] = "sell"
+        df.loc[unknown & (df["amount"] > 0), "direction"] = "buy"
+        out = df[df["direction"].isin(["buy", "sell"])].copy()
     else:
-        out = df[df["amount"] > 0]
+        # No txn_type — infer purely from amount sign
+        out = df.copy()
+        out["direction"] = np.where(out["amount"] >= 0, "buy", "sell")
+
+    # Normalize amount + units to positive; direction carries the sign semantics
+    out["amount"] = out["amount"].abs()
+    if "units" in out.columns:
+        out["units"] = pd.to_numeric(out["units"], errors="coerce").abs()
 
     return out.reset_index(drop=True)
 
@@ -446,48 +465,195 @@ def compute_scenario(
     current_nav: float,
     label: str,
 ) -> dict:
+    """
+    Single-NAV-series scenario, used for the alternate-fund side. Honors
+    `direction`: buys add units (cashflow -amount), sells remove units
+    (cashflow +amount). Tracks a running unit balance to flag rows where
+    the alt fund's units would go negative (sell exceeded available value).
+    """
     today = date.today()
-    rows  = []
+    purchases = purchases.sort_values("date").reset_index(drop=True)
+
+    rows = []
+    running_units = 0.0
+    negative_events = []
     for _, r in purchases.iterrows():
-        d   = r["date"].date()
-        amt = abs(float(r["amount"]))
+        d         = r["date"].date()
+        amt       = abs(float(r["amount"]))
+        direction = r.get("direction", "buy")
+        if direction not in ("buy", "sell"):
+            direction = "buy"
         nav = nav_on_or_before(nav_series, d)
+        if nav:
+            row_units    = amt / nav
+            signed_units = row_units if direction == "buy" else -row_units
+            running_units += signed_units
+            if direction == "sell" and running_units < 0:
+                negative_events.append({"date": d, "running": running_units, "amount": amt})
+        else:
+            signed_units = None
         rows.append({
-            "date":   d,
-            "amount": amt,
-            "nav":    nav,
-            "units":  amt / nav if nav else None,
-            "status": "ok" if nav else "no_nav",
+            "date":      d,
+            "direction": direction,
+            "amount":    amt,
+            "nav":       nav,
+            "units":     signed_units,
+            "status":    "ok" if nav else "no_nav",
         })
 
     df_rows = pd.DataFrame(rows)
     matched = df_rows[df_rows["status"] == "ok"]
+    buys    = matched[matched["direction"] == "buy"]
+    sells   = matched[matched["direction"] == "sell"]
 
-    total_invested = matched["amount"].sum()
-    total_units    = matched["units"].sum()
-    current_value  = total_units * current_nav
+    total_bought    = float(buys["amount"].sum())
+    total_sold      = float(sells["amount"].sum())
+    net_invested    = total_bought - total_sold
+    remaining_units = float(matched["units"].sum())  # signed
+    current_value   = remaining_units * current_nav
+    total_proceeds  = current_value + total_sold
+    absolute_ret    = total_proceeds - total_bought
+    return_pct      = (absolute_ret / total_bought * 100) if total_bought else 0
 
-    # XIRR
-    cf_dates   = list(matched["date"]) + [today]
-    cf_amounts = [-r for r in matched["amount"]] + [current_value]
+    # Cashflows: buys negative, sells positive, plus terminal current_value
+    cf_dates   = []
+    cf_amounts = []
+    for _, r in matched.iterrows():
+        cf_dates.append(r["date"])
+        cf_amounts.append(-r["amount"] if r["direction"] == "buy" else r["amount"])
+    cf_dates.append(today)
+    cf_amounts.append(current_value)
     xi = xirr(
         cf_amounts,
         [datetime.combine(d, datetime.min.time()) for d in cf_dates],
     )
 
     return {
-        "label":          label,
-        "nav_series":     nav_series,
-        "current_nav":    current_nav,
-        "total_invested": total_invested,
-        "total_units":    total_units,
-        "current_value":  current_value,
-        "absolute_ret":   current_value - total_invested,
-        "return_pct":     ((current_value - total_invested) / total_invested * 100) if total_invested else 0,
-        "xirr":           xi,
-        "detail":         df_rows,
-        "matched":        len(matched),
-        "skipped":        len(df_rows) - len(matched),
+        "label":           label,
+        "nav_series":      nav_series,
+        "current_nav":     current_nav,
+        "total_bought":    total_bought,
+        "total_sold":      total_sold,
+        "total_invested":  net_invested,    # alias (back-compat for older callers)
+        "net_invested":    net_invested,
+        "total_units":     remaining_units,
+        "current_value":   current_value,
+        "total_proceeds":  total_proceeds,
+        "absolute_ret":    absolute_ret,
+        "return_pct":      return_pct,
+        "xirr":            xi,
+        "detail":          df_rows,
+        "matched":         len(matched),
+        "skipped":         len(df_rows) - len(matched),
+        "n_buys":          len(buys),
+        "n_sells":         len(sells),
+        "negative_events": negative_events,
+    }
+
+
+def compute_scenario_pooled(
+    purchases: pd.DataFrame,
+    name_to_series: dict,
+    label: str = "Actual (pooled)",
+) -> dict:
+    """
+    Pooled-actual scenario: each purchase row is valued in its own fund's NAV.
+    Honors `direction` per row: buys add units, sells remove units.
+    Per-fund running balance is tracked; the actual side typically shouldn't
+    go negative (user can't have sold more than they owned), but if the data
+    says otherwise we record it for transparency.
+    """
+    today = date.today()
+    purchases = purchases.sort_values("date").reset_index(drop=True)
+
+    rows    = []
+    running = {}   # fund -> running unit balance
+    negative_events = []
+    for _, r in purchases.iterrows():
+        fund      = r["scheme_name"]
+        d         = r["date"].date()
+        amt       = abs(float(r["amount"]))
+        direction = r.get("direction", "buy")
+        if direction not in ("buy", "sell"):
+            direction = "buy"
+        series = name_to_series.get(fund)
+        nav    = nav_on_or_before(series, d) if series is not None else None
+        if nav:
+            row_units    = amt / nav
+            signed_units = row_units if direction == "buy" else -row_units
+            running[fund] = running.get(fund, 0.0) + signed_units
+            if direction == "sell" and running[fund] < 0:
+                negative_events.append(
+                    {"fund": fund, "date": d, "running": running[fund], "amount": amt}
+                )
+        else:
+            signed_units = None
+        rows.append({
+            "date":      d,
+            "fund":      fund,
+            "direction": direction,
+            "amount":    amt,
+            "nav":       nav,
+            "units":     signed_units,
+            "status":    "ok" if nav else "no_nav",
+        })
+
+    df_rows = pd.DataFrame(rows)
+    matched = df_rows[df_rows["status"] == "ok"]
+    buys    = matched[matched["direction"] == "buy"]
+    sells   = matched[matched["direction"] == "sell"]
+
+    total_bought = float(buys["amount"].sum())
+    total_sold   = float(sells["amount"].sum())
+    net_invested = total_bought - total_sold
+    total_units  = float(matched["units"].sum())  # signed cross-fund sum
+
+    # Current value: per-fund (remaining_units × that fund's current NAV), summed
+    current_value = 0.0
+    if not matched.empty:
+        for fund, grp in matched.groupby("fund"):
+            series = name_to_series.get(fund)
+            if series is None or series.empty:
+                continue
+            cur_nav = float(series.iloc[-1])
+            current_value += float(grp["units"].sum()) * cur_nav
+
+    total_proceeds = current_value + total_sold
+    absolute_ret   = total_proceeds - total_bought
+    return_pct     = (absolute_ret / total_bought * 100) if total_bought else 0
+
+    cf_dates   = []
+    cf_amounts = []
+    for _, r in matched.iterrows():
+        cf_dates.append(r["date"])
+        cf_amounts.append(-r["amount"] if r["direction"] == "buy" else r["amount"])
+    cf_dates.append(today)
+    cf_amounts.append(current_value)
+    xi = xirr(
+        cf_amounts,
+        [datetime.combine(d, datetime.min.time()) for d in cf_dates],
+    )
+
+    return {
+        "label":           label,
+        "nav_series":      None,
+        "current_nav":     None,
+        "total_bought":    total_bought,
+        "total_sold":      total_sold,
+        "total_invested":  net_invested,
+        "net_invested":    net_invested,
+        "total_units":     total_units,
+        "current_value":   current_value,
+        "total_proceeds":  total_proceeds,
+        "absolute_ret":    absolute_ret,
+        "return_pct":      return_pct,
+        "xirr":            xi,
+        "detail":          df_rows,
+        "matched":         len(matched),
+        "skipped":         len(df_rows) - len(matched),
+        "n_buys":          len(buys),
+        "n_sells":         len(sells),
+        "negative_events": negative_events,
     }
 
 
@@ -547,134 +713,219 @@ st.markdown(
 )
 
 # ─── Step 1 · Upload ─────────────────────────────────────────────────────────
-st.markdown('<div class="step-label">Step 1 · Upload Zerodha Coin statement</div>', unsafe_allow_html=True)
+st.markdown('<div class="step-label">Step 1 · Upload Zerodha Coin statement(s)</div>', unsafe_allow_html=True)
 
-uploaded = st.file_uploader(
-    "Zerodha Coin Excel export",
+uploaded_files = st.file_uploader(
+    "Zerodha Coin Excel/CSV exports",
     type=["csv", "xlsx", "xls"],
-    help="Coin → Portfolio → Transaction History → Download CSV or Excel",
+    accept_multiple_files=True,
+    help="Coin → Portfolio → Transaction History → Download CSV or Excel. Upload multiple files to combine them.",
 )
 
-purchases_df  = None
-selected_fund = None
+purchases_df    = None
+selected_funds  = []
 
-if uploaded:
-    with st.spinner("Parsing…"):
-        purchases_df = parse_zerodha(uploaded)
-    if purchases_df is not None:
-        st.success(f"✓ {len(purchases_df)} purchase transactions parsed")
+if uploaded_files:
+    parsed_frames = []
+    for f in uploaded_files:
+        with st.spinner(f"Parsing {f.name}…"):
+            df = parse_zerodha(f)
+        if df is not None and not df.empty:
+            parsed_frames.append(df)
+            st.success(f"✓ {f.name} → {len(df)} purchase transactions")
+        else:
+            st.error(f"✗ {f.name}: could not parse (skipped)")
 
-# ─── Step 2 · Select fund from statement ─────────────────────────────────────
-actual_code = None
-alt_code    = None
+    if parsed_frames:
+        combined = pd.concat(parsed_frames, ignore_index=True)
+        before   = len(combined)
+
+        # Prefer trade_id when every row carries a non-empty value (Zerodha CSV path).
+        use_trade_id = False
+        if "trade_id" in combined.columns:
+            tid = combined["trade_id"].astype(str).str.strip()
+            if tid.notna().all() and (tid != "").all() and (tid.str.lower() != "nan").all():
+                use_trade_id = True
+
+        if use_trade_id:
+            combined = combined.drop_duplicates(subset=["trade_id"]).reset_index(drop=True)
+        else:
+            # Row-key fallback covers legacy Excel which lacks trade_id.
+            if {"units", "nav"}.issubset(combined.columns):
+                keycols = [c for c in ["scheme_name", "date", "units", "nav", "trade_type", "direction"] if c in combined.columns]
+            else:
+                keycols = [c for c in ["scheme_name", "date", "amount", "txn_type", "direction"] if c in combined.columns]
+            if keycols:
+                combined = combined.drop_duplicates(subset=keycols).reset_index(drop=True)
+
+        dropped = before - len(combined)
+        if dropped > 0:
+            method = "trade_id" if use_trade_id else "scheme/date/units/nav"
+            st.markdown(
+                f'<div class="box box-yellow">Removed <strong>{dropped}</strong> duplicate row(s) across files '
+                f'(deduped by {method}).</div>',
+                unsafe_allow_html=True,
+            )
+        purchases_df = combined
+
+# ─── Step 2 · Select fund(s) from statement ──────────────────────────────────
+actual_codes: dict = {}   # scheme_name (from statement) -> AMFI scheme_code
+alt_code = None
 
 if purchases_df is not None:
-    st.markdown('<div class="step-label">Step 2 · Select fund from your statement</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-label">Step 2 · Select fund(s) from your statement</div>', unsafe_allow_html=True)
 
     funds_in_file = sorted(purchases_df["scheme_name"].dropna().unique().tolist())
-    selected_fund = st.selectbox("Your fund (from statement)", funds_in_file)
+    selected_funds = st.multiselect(
+        "Your fund(s) — pick one or more to club into a combined real portfolio",
+        funds_in_file,
+        default=[],
+    )
 
-    if selected_fund:
-        fund_txns = purchases_df[purchases_df["scheme_name"] == selected_fund].copy()
-        date_range_str = (
-            f"{fund_txns['date'].min().strftime('%d %b %Y')} → "
-            f"{fund_txns['date'].max().strftime('%d %b %Y')}"
-        )
+    if selected_funds:
+        def _txn_blurb(frame: pd.DataFrame) -> str:
+            """'12 buys, 3 sells' or '12 purchases' depending on whether sells exist."""
+            if "direction" in frame.columns:
+                buys  = (frame["direction"] == "buy").sum()
+                sells = (frame["direction"] == "sell").sum()
+                if sells > 0:
+                    return f"{buys} buys, {sells} sells"
+            return f"{len(frame)} purchases"
+
+        # Per-fund mini-summary
+        badges = []
+        for fund in selected_funds:
+            ftx = purchases_df[purchases_df["scheme_name"] == fund]
+            badges.append(
+                f'<span class="range-badge">{fund} &nbsp;·&nbsp; '
+                f'{_txn_blurb(ftx)} &nbsp;·&nbsp; '
+                f'{ftx["date"].min().strftime("%d %b %Y")} → '
+                f'{ftx["date"].max().strftime("%d %b %Y")}</span>'
+            )
+        st.markdown("<br>".join(badges), unsafe_allow_html=True)
+
+        # Combined badge
+        pooled = purchases_df[purchases_df["scheme_name"].isin(selected_funds)]
+        plural = "s" if len(selected_funds) > 1 else ""
         st.markdown(
-            f'<span class="range-badge">{len(fund_txns)} purchases &nbsp;·&nbsp; {date_range_str}</span>',
+            f'<div class="box box-blue" style="margin-top:.6rem"><strong>Combined:</strong> '
+            f'{len(selected_funds)} fund{plural} &nbsp;·&nbsp; '
+            f'{_txn_blurb(pooled)} &nbsp;·&nbsp; '
+            f'{pooled["date"].min().strftime("%d %b %Y")} → '
+            f'{pooled["date"].max().strftime("%d %b %Y")}</div>',
             unsafe_allow_html=True,
         )
 
         with st.expander("Preview transactions"):
-            show = [c for c in ["date","txn_type","amount","units","nav"] if c in fund_txns.columns]
-            st.dataframe(
-                fund_txns[show].sort_values("date").assign(
-                    date=lambda x: x["date"].dt.strftime("%d %b %Y")
-                ),
-                use_container_width=True, hide_index=True,
+            cols = ["date", "scheme_name"]
+            for c in ["direction", "txn_type", "trade_type", "amount", "units", "nav"]:
+                if c in pooled.columns:
+                    cols.append(c)
+            disp = pooled[cols].sort_values("date").rename(columns={"scheme_name": "fund"}).copy()
+            disp["date"] = disp["date"].dt.strftime("%d %b %Y")
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+# ─── Step 3 · Identify each actual fund in AMFI data ─────────────────────────
+if purchases_df is not None and selected_funds:
+    st.markdown('<div class="step-label">Step 3 · Match your fund(s) in AMFI database</div>', unsafe_allow_html=True)
+
+    isin_cols = [c for c in fund_df.columns if "isin" in c.lower()]
+
+    def _match_isin(isin_val: str):
+        """Return (scheme_code, scheme_name) on hit, else None."""
+        if not isin_val:
+            return None
+        target = isin_val.upper()
+        for col in isin_cols:
+            m = fund_df[fund_df[col].astype(str).str.upper() == target]
+            if not m.empty:
+                code = int(m.iloc[0]["scheme_code"])
+                name = m.iloc[0].get("scheme_name", f"Scheme {code}")
+                return code, name
+        return None
+
+    failures = []  # [(idx, fund_name, isin_or_None)]
+    status_lines = []
+
+    for idx, fund in enumerate(selected_funds):
+        ftx = purchases_df[purchases_df["scheme_name"] == fund]
+        isin_val = None
+        if "isin" in ftx.columns:
+            isins = ftx["isin"].dropna().astype(str).str.strip()
+            isins = isins[isins != ""].unique()
+            if len(isins) >= 1:
+                isin_val = isins[0]
+
+        match = _match_isin(isin_val)
+        if match:
+            code, matched_name = match
+            actual_codes[fund] = code
+            status_lines.append(
+                f'<div class="box box-green">✓ <strong>{fund}</strong> → '
+                f'{matched_name} <code>[{code}]</code></div>'
             )
-
-# ─── Step 3 · Identify actual fund in AMFI data ───────────────────────────────
-if purchases_df is not None and selected_fund:
-    st.markdown('<div class="step-label">Step 3 · Match your actual fund in AMFI database</div>', unsafe_allow_html=True)
-
-    # Try ISIN auto-match first — Zerodha CSV tradebook includes ISIN
-    fund_txns_for_isin = purchases_df[purchases_df["scheme_name"] == selected_fund]
-    isin_val = None
-    if "isin" in fund_txns_for_isin.columns:
-        isins = fund_txns_for_isin["isin"].dropna().unique()
-        if len(isins) == 1:
-            isin_val = isins[0]
-
-    auto_matched_code = None
-    if isin_val and "isin" in fund_df.columns:
-        isin_match = fund_df[fund_df["isin"].astype(str).str.upper() == isin_val.upper()]
-        if not isin_match.empty:
-            auto_matched_code = int(isin_match.iloc[0]["scheme_code"])
-            matched_name = isin_match.iloc[0].get("scheme_name", f"Scheme {auto_matched_code}")
-            st.markdown(
-                f'<div class="box box-green">✓ Auto-matched via ISIN <code>{isin_val}</code> → '
-                f'<strong>{matched_name}</strong> [{auto_matched_code}]</div>',
-                unsafe_allow_html=True,
+        else:
+            reason = (
+                f"ISIN <code>{isin_val}</code> not in database"
+                if isin_val else "no ISIN in statement"
             )
-
-    # Also check ISIN_Div_Payout/Growth column which InertExpert2911 uses
-    if auto_matched_code is None and isin_val:
-        for col in fund_df.columns:
-            if "isin" in col.lower():
-                match = fund_df[fund_df[col].astype(str).str.upper() == isin_val.upper()]
-                if not match.empty:
-                    auto_matched_code = int(match.iloc[0]["scheme_code"])
-                    matched_name = match.iloc[0].get("scheme_name", f"Scheme {auto_matched_code}")
-                    st.markdown(
-                        f'<div class="box box-green">✓ Auto-matched via ISIN <code>{isin_val}</code> → '
-                        f'<strong>{matched_name}</strong> [{auto_matched_code}]</div>',
-                        unsafe_allow_html=True,
-                    )
-                    break
-
-    actual_code = auto_matched_code
-
-    # Manual fallback if ISIN match failed
-    if actual_code is None:
-        if isin_val:
-            st.markdown(
-                f'<div class="box box-yellow">⚠ ISIN <code>{isin_val}</code> not found in database. '
-                f'Search manually below.</div>',
-                unsafe_allow_html=True,
+            status_lines.append(
+                f'<div class="box box-yellow">✗ <strong>{fund}</strong> → {reason}. '
+                f'Search manually below.</div>'
             )
-        with st.expander("Search manually" if actual_code is None else "Override auto-match"):
+            failures.append((idx, fund))
+
+    st.markdown("\n".join(status_lines), unsafe_allow_html=True)
+
+    # Manual-search expander per failure (keys namespaced by index to avoid collisions)
+    for idx, fund in failures:
+        with st.expander(f"Manual match · {fund}"):
             c1, c2 = st.columns([3, 1])
             with c1:
-                actual_q = st.text_input("Search actual fund", value=selected_fund[:50], key="aq")
+                q = st.text_input("Search", value=fund[:50], key=f"actual_q_{idx}")
             with c2:
                 st.markdown("<br>", unsafe_allow_html=True)
-                if st.button("Search", key="aq_btn"):
-                    st.session_state["actual_results"] = search_funds(fund_df, actual_q).to_dict("records")
-
-            if "actual_results" not in st.session_state:
-                st.session_state["actual_results"] = []
-
-            if st.session_state["actual_results"]:
+                if st.button("Search", key=f"actual_q_btn_{idx}"):
+                    st.session_state[f"actual_results_{idx}"] = (
+                        search_funds(fund_df, q).to_dict("records")
+                    )
+            results = st.session_state.get(f"actual_results_{idx}", [])
+            if results:
                 opts = {
                     f"{r.get('scheme_name','?')}  [{r['scheme_code']}]": int(r["scheme_code"])
-                    for r in st.session_state["actual_results"]
+                    for r in results
                 }
-                actual_code = opts[st.selectbox("Select actual fund", list(opts.keys()), key="actual_sel")]
+                chosen = st.selectbox(
+                    "Select fund", list(opts.keys()), key=f"actual_sel_{idx}"
+                )
+                actual_codes[fund] = opts[chosen]
             else:
-                manual = st.number_input("Or enter scheme code", min_value=0, step=1, value=0, key="actual_manual")
-                actual_code = int(manual) if manual else None
+                manual = st.number_input(
+                    "Or enter scheme code",
+                    min_value=0, step=1, value=0,
+                    key=f"actual_manual_{idx}",
+                )
+                if manual:
+                    actual_codes[fund] = int(manual)
 
-    # Show actual fund data range
-    if actual_code and actual_code in nav_index:
-        a_start, a_end = fund_date_range(nav_index[actual_code])
+    matched_n = len(actual_codes)
+    total_n   = len(selected_funds)
+    if matched_n < total_n:
         st.markdown(
-            f'<span class="range-badge">Actual fund NAV data: {a_start.strftime("%d %b %Y")} → {a_end.strftime("%d %b %Y")}</span>',
+            f'<div class="box box-yellow">'
+            f'<strong>{matched_n} of {total_n}</strong> fund(s) matched. '
+            f'Resolve the rest above to enable the comparison.</div>',
             unsafe_allow_html=True,
         )
 
 # ─── Step 4 · Alternate fund ─────────────────────────────────────────────────
-if purchases_df is not None and selected_fund and actual_code:
+all_actuals_matched = (
+    purchases_df is not None
+    and bool(selected_funds)
+    and len(actual_codes) == len(selected_funds)
+)
+
+if all_actuals_matched:
     st.markdown('<div class="step-label">Step 4 · Pick the alternate fund to compare</div>', unsafe_allow_html=True)
 
     # Build the autocomplete option list once per process and stash on the
@@ -704,20 +955,15 @@ if purchases_df is not None and selected_fund and actual_code:
     )
     alt_code = alt_label_to_code[alt_label] if alt_label else None
 
-    # Show alternate fund availability range
+    # Show alternate fund availability range — coverage check uses pooled purchases
     if alt_code:
         if alt_code in nav_index:
             alt_start, alt_end = fund_date_range(nav_index[alt_code])
-            fund_txns  = purchases_df[purchases_df["scheme_name"] == selected_fund]
-            txn_start  = fund_txns["date"].min().date()
-            txn_end    = fund_txns["date"].max().date()
+            pooled_txns = purchases_df[purchases_df["scheme_name"].isin(selected_funds)]
 
-            # Warn if purchases predate the fund
-            missing_before = fund_txns[fund_txns["date"].dt.date < alt_start]
-            coverage_pct   = round((1 - len(missing_before) / len(fund_txns)) * 100)
-
+            missing_before = pooled_txns[pooled_txns["date"].dt.date < alt_start]
             color = "box-green" if len(missing_before) == 0 else "box-yellow"
-            warn  = (
+            warn = (
                 f"⚠️ {len(missing_before)} of your purchases ({missing_before['date'].min().strftime('%d %b %Y')} – "
                 f"{missing_before['date'].max().strftime('%d %b %Y')}) predate this fund's launch. "
                 f"They will be excluded from the comparison."
@@ -736,179 +982,314 @@ if purchases_df is not None and selected_fund and actual_code:
             alt_code = None
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
-if purchases_df is not None and selected_fund and actual_code and alt_code:
+exclude_sells = False
+if all_actuals_matched and alt_code:
     st.markdown("---")
+
+    pooled_for_toggle = purchases_df[purchases_df["scheme_name"].isin(selected_funds)]
+    has_sells_in_scope = (
+        "direction" in pooled_for_toggle.columns
+        and (pooled_for_toggle["direction"] == "sell").any()
+    )
+    if has_sells_in_scope:
+        exclude_sells = st.checkbox(
+            "Exclude sells from calculation (treat all bought units as still held)",
+            value=False,
+            key="exclude_sells",
+        )
+
     run = st.button("⚡  Run Comparison")
 
     if run:
-        if actual_code not in nav_index:
-            st.error(f"Actual fund scheme code {actual_code} not found in NAV data.")
-        elif alt_code not in nav_index:
+        if alt_code not in nav_index:
             st.error(f"Alternate fund scheme code {alt_code} not found in NAV data.")
         else:
-            fund_txns = purchases_df[purchases_df["scheme_name"] == selected_fund].copy()
+            pooled_txns = purchases_df[purchases_df["scheme_name"].isin(selected_funds)].copy()
 
-            actual_series  = nav_index[actual_code]
-            alt_series     = nav_index[alt_code]
-            actual_cur_nav = float(actual_series.iloc[-1])
-            alt_cur_nav    = float(alt_series.iloc[-1])
+            if exclude_sells and "direction" in pooled_txns.columns:
+                pooled_txns = pooled_txns[pooled_txns["direction"] == "buy"].copy()
 
-            actual_name = fund_df[fund_df["scheme_code"] == actual_code]["scheme_name"].values
-            alt_name    = fund_df[fund_df["scheme_code"] == alt_code]["scheme_name"].values
-            actual_name = actual_name[0] if len(actual_name) else f"Fund {actual_code}"
-            alt_name    = alt_name[0]    if len(alt_name)    else f"Fund {alt_code}"
+            # Build name → NAV-series map for the pooled actual side.
+            name_to_series: dict = {}
+            missing_codes = []
+            for fund, code in actual_codes.items():
+                if code in nav_index:
+                    name_to_series[fund] = nav_index[code]
+                else:
+                    missing_codes.append((fund, code))
 
-            with st.spinner("Computing…"):
-                actual_res = compute_scenario(fund_txns, actual_series, actual_cur_nav, actual_name)
-                alt_res    = compute_scenario(fund_txns, alt_series,    alt_cur_nav,    alt_name)
+            if missing_codes:
+                for fund, code in missing_codes:
+                    st.error(f"Scheme code {code} for '{fund}' not found in NAV data.")
+            else:
+                alt_series  = nav_index[alt_code]
+                alt_cur_nav = float(alt_series.iloc[-1])
+                alt_name_arr = fund_df[fund_df["scheme_code"] == alt_code]["scheme_name"].values
+                alt_name     = alt_name_arr[0] if len(alt_name_arr) else f"Fund {alt_code}"
 
-            # ── Summary stats table ───────────────────────────────────────────
-            st.markdown('<div class="step-label">Comparison Summary</div>', unsafe_allow_html=True)
-
-            xi_a = f"{actual_res['xirr']*100:.2f}%" if actual_res["xirr"] else "N/A"
-            xi_b = f"{alt_res['xirr']*100:.2f}%"    if alt_res["xirr"]    else "N/A"
-
-            # Determine which is better for each metric
-            def _cls(a_val, b_val, higher_is_better=True):
-                if a_val is None or b_val is None:
-                    return "neutral", "neutral"
-                better = a_val > b_val if higher_is_better else a_val < b_val
-                return ("better", "worse") if better else ("worse", "better")
-
-            cv_a, cv_b       = _cls(actual_res["current_value"], alt_res["current_value"])
-            ret_a, ret_b     = _cls(actual_res["return_pct"],    alt_res["return_pct"])
-            xi_cls_a, xi_cls_b = _cls(
-                actual_res["xirr"] or 0, alt_res["xirr"] or 0
-            )
-
-            val_diff  = alt_res["current_value"] - actual_res["current_value"]
-            xirr_diff = ((alt_res["xirr"] or 0) - (actual_res["xirr"] or 0)) * 100
-            winner    = alt_name if val_diff >= 0 else actual_name
-
-            verdict_color = "box-green" if val_diff >= 0 else "box-red"
-            verdict_sign  = "+" if val_diff >= 0 else ""
-            st.markdown(
-                f'<div class="box {verdict_color}">'
-                f'<strong>Verdict:</strong> Switching to <em>{alt_name}</em> would have '
-                f'{"added" if val_diff >= 0 else "cost"} you '
-                f'<strong>₹{abs(val_diff):,.0f}</strong> '
-                f'({verdict_sign}{xirr_diff:.2f}% XIRR difference).'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-            a_col_hdr = f"Actual · {actual_name[:55]}"
-            b_col_hdr = f"Alternate · {alt_name[:55]}"
-
-            rows_html = ""
-            metrics = [
-                ("Total Invested",   f"₹{actual_res['total_invested']:,.0f}",  f"₹{alt_res['total_invested']:,.0f}",  "neutral", "neutral"),
-                ("Transactions matched",
-                    str(actual_res["matched"]),
-                    str(alt_res["matched"]),
-                    "neutral", "neutral"),
-                ("Transactions skipped (no NAV)",
-                    str(actual_res["skipped"]),
-                    str(alt_res["skipped"]),
-                    "neutral", "neutral"),
-                ("Current NAV",      f"₹{actual_res['current_nav']:,.4f}",     f"₹{alt_res['current_nav']:,.4f}",     "neutral", "neutral"),
-                ("Total Units",      f"{actual_res['total_units']:,.4f}",       f"{alt_res['total_units']:,.4f}",       "neutral", "neutral"),
-                ("Current Value",    f"₹{actual_res['current_value']:,.0f}",   f"₹{alt_res['current_value']:,.0f}",   cv_a,    cv_b),
-                ("Absolute Return",  f"₹{actual_res['absolute_ret']:,.0f}",    f"₹{alt_res['absolute_ret']:,.0f}",    cv_a,    cv_b),
-                ("Total Return %",   f"{actual_res['return_pct']:+.2f}%",      f"{alt_res['return_pct']:+.2f}%",      ret_a,   ret_b),
-                ("XIRR",             xi_a,                                      xi_b,                                  xi_cls_a, xi_cls_b),
-            ]
-            for label, a_val, b_val, cls_a, cls_b in metrics:
-                rows_html += (
-                    f"<tr>"
-                    f"<td class='metric-col'>{label}</td>"
-                    f"<td class='{cls_a}'>{a_val}</td>"
-                    f"<td class='{cls_b}'>{b_val}</td>"
-                    f"</tr>"
+                n_funds      = len(selected_funds)
+                actual_label = (
+                    selected_funds[0] if n_funds == 1
+                    else f"{n_funds} funds clubbed"
                 )
 
-            st.markdown(f"""
-            <table class="summary-table">
-              <thead><tr>
-                <th style="width:30%">Metric</th>
-                <th>{a_col_hdr}</th>
-                <th class="winner-col">{b_col_hdr}</th>
-              </tr></thead>
-              <tbody>{rows_html}</tbody>
-            </table>
-            """, unsafe_allow_html=True)
+                with st.spinner("Computing…"):
+                    actual_res = compute_scenario_pooled(pooled_txns, name_to_series, actual_label)
+                    alt_res    = compute_scenario(pooled_txns, alt_series, alt_cur_nav, alt_name)
 
-            # ── Transaction-level table ───────────────────────────────────────
-            st.markdown('<div class="step-label" style="margin-top:2rem">Transaction Detail</div>', unsafe_allow_html=True)
+                sells_present = (actual_res["n_sells"] + alt_res["n_sells"]) > 0
 
-            d_actual = actual_res["detail"].rename(columns={"nav": "actual_nav", "units": "actual_units", "status": "actual_status"})
-            d_alt    = alt_res["detail"].rename(columns={"nav": "alt_nav",    "units": "alt_units",    "status": "alt_status"})
+                # ── Verdict ───────────────────────────────────────────────────
+                # current_value comparison is mathematically equivalent to
+                # total_proceeds comparison (cash extracted is mirrored), so
+                # we use current_value for the verdict diff.
+                val_diff  = alt_res["current_value"] - actual_res["current_value"]
+                xirr_diff = ((alt_res["xirr"] or 0) - (actual_res["xirr"] or 0)) * 100
+                verdict_color = "box-green" if val_diff >= 0 else "box-red"
+                verdict_sign  = "+" if val_diff >= 0 else ""
 
-            merged = d_actual[["date","amount","actual_nav","actual_units","actual_status"]].merge(
-                d_alt[["date","alt_nav","alt_units","alt_status"]], on="date", how="outer"
-            ).sort_values("date").reset_index(drop=True)
+                if n_funds == 1:
+                    lead = f"Switching to <em>{alt_name}</em>"
+                else:
+                    lead = (
+                        f"Clubbing your {n_funds} funds "
+                        f"({len(pooled_txns)} transactions) into <em>{alt_name}</em>"
+                    )
+                if exclude_sells:
+                    lead += " <span style=\"opacity:.7\">(sells excluded)</span>"
 
-            # Friendly formatting
-            def fmt_nav(x):
-                return f"₹{x:,.4f}" if pd.notna(x) else "—"
-            def fmt_units(x):
-                return f"{x:,.4f}" if pd.notna(x) else "—"
-            def fmt_amt(x):
-                return f"₹{x:,.0f}" if pd.notna(x) else "—"
-            def fmt_status(actual_s, alt_s):
-                parts = []
-                if actual_s == "no_nav": parts.append("⚠ no NAV (actual)")
-                if alt_s    == "no_nav": parts.append("⚠ no NAV (alt)")
-                return ", ".join(parts) if parts else "✓"
-
-            display = pd.DataFrame({
-                "Date":         merged["date"].apply(lambda x: x.strftime("%d %b %Y") if hasattr(x,"strftime") else str(x)),
-                "Amount":       merged["amount"].apply(fmt_amt),
-                "Actual NAV":   merged["actual_nav"].apply(fmt_nav),
-                "Actual Units": merged["actual_units"].apply(fmt_units),
-                "Alt NAV":      merged["alt_nav"].apply(fmt_nav),
-                "Alt Units":    merged["alt_units"].apply(fmt_units),
-                "Notes":        merged.apply(lambda r: fmt_status(r.get("actual_status"), r.get("alt_status")), axis=1),
-            })
-
-            # Count missing
-            missing_actual = (merged["actual_status"] == "no_nav").sum()
-            missing_alt    = (merged["alt_status"]    == "no_nav").sum()
-            if missing_actual or missing_alt:
                 st.markdown(
-                    f'<div class="box box-yellow">'
-                    f'Missing NAV data → Actual fund: <strong>{missing_actual}</strong> dates, '
-                    f'Alternate fund: <strong>{missing_alt}</strong> dates. '
-                    f'These rows are excluded from XIRR and return calculations.</div>',
+                    f'<div class="box {verdict_color}">'
+                    f'<strong>Verdict:</strong> {lead} would have '
+                    f'{"added" if val_diff >= 0 else "cost"} you '
+                    f'<strong>₹{abs(val_diff):,.0f}</strong> '
+                    f'({verdict_sign}{xirr_diff:.2f}% XIRR difference).'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
 
-            st.dataframe(display, use_container_width=True, hide_index=True)
+                # ── Negative-units warning (alt side) ─────────────────────────
+                neg = alt_res.get("negative_events") or []
+                if neg:
+                    first = neg[0]
+                    extra = f" (and {len(neg) - 1} more such event(s))" if len(neg) > 1 else ""
+                    st.markdown(
+                        f'<div class="box box-yellow">'
+                        f'⚠️ On <strong>{first["date"].strftime("%d %b %Y")}</strong> your sell of '
+                        f'<strong>₹{first["amount"]:,.0f}</strong> exceeded the alt fund\'s value '
+                        f'at that date{extra}. Alt units went negative for math consistency — '
+                        f'the comparison still computes but the alt scenario\'s remaining units '
+                        f'is not physically realizable.</div>',
+                        unsafe_allow_html=True,
+                    )
 
-            # ── Excel export ──────────────────────────────────────────────────
-            st.markdown('<div class="step-label">Export</div>', unsafe_allow_html=True)
+                # ── Summary stats table ───────────────────────────────────────
+                st.markdown('<div class="step-label">Comparison Summary</div>', unsafe_allow_html=True)
 
-            summary_df = pd.DataFrame([
-                {"Metric": m[0], "Actual Fund": m[1], "Alternate Fund": m[2]}
-                for m in metrics
-            ])
-            export_df = display.copy()
+                xi_a = f"{actual_res['xirr']*100:.2f}%" if actual_res["xirr"] else "N/A"
+                xi_b = f"{alt_res['xirr']*100:.2f}%"    if alt_res["xirr"]    else "N/A"
 
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as w:
-                summary_df.to_excel(w, sheet_name="Summary",      index=False)
-                export_df.to_excel(w,  sheet_name="Transactions",  index=False)
-            buf.seek(0)
-            st.download_button(
-                "⬇ Download Excel Report",
-                data=buf,
-                file_name=f"mf_compare_{date.today().isoformat()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                def _cls(a_val, b_val, higher_is_better=True):
+                    if a_val is None or b_val is None:
+                        return "neutral", "neutral"
+                    better = a_val > b_val if higher_is_better else a_val < b_val
+                    return ("better", "worse") if better else ("worse", "better")
+
+                cv_a, cv_b         = _cls(actual_res["current_value"], alt_res["current_value"])
+                pr_a, pr_b         = _cls(actual_res["total_proceeds"], alt_res["total_proceeds"])
+                ret_a, ret_b       = _cls(actual_res["return_pct"],    alt_res["return_pct"])
+                xi_cls_a, xi_cls_b = _cls(actual_res["xirr"] or 0, alt_res["xirr"] or 0)
+
+                actual_nav_str = (
+                    f"₹{actual_res['current_nav']:,.4f}"
+                    if actual_res.get("current_nav") is not None else "—"
+                )
+                a_col_hdr = (
+                    f"Actual · {selected_funds[0][:55]}" if n_funds == 1
+                    else f"Actual · {n_funds} funds clubbed"
+                )
+                b_col_hdr = f"Alternate · {alt_name[:55]}"
+
+                # Build metrics list. Sell-aware rows surface only when sells are present.
+                metrics = []
+
+                if sells_present:
+                    metrics.extend([
+                        ("Total Bought",
+                            f"₹{actual_res['total_bought']:,.0f}",
+                            f"₹{alt_res['total_bought']:,.0f}",
+                            "neutral", "neutral"),
+                        ("Total Sold",
+                            f"₹{actual_res['total_sold']:,.0f}",
+                            f"₹{alt_res['total_sold']:,.0f}",
+                            "neutral", "neutral"),
+                        ("Net Invested",
+                            f"₹{actual_res['net_invested']:,.0f}",
+                            f"₹{alt_res['net_invested']:,.0f}",
+                            "neutral", "neutral"),
+                    ])
+                else:
+                    metrics.append(
+                        ("Total Invested",
+                            f"₹{actual_res['total_invested']:,.0f}",
+                            f"₹{alt_res['total_invested']:,.0f}",
+                            "neutral", "neutral"),
+                    )
+
+                metrics.extend([
+                    ("Buy transactions" if sells_present else "Transactions matched",
+                        str(actual_res["n_buys"] if sells_present else actual_res["matched"]),
+                        str(alt_res["n_buys"]    if sells_present else alt_res["matched"]),
+                        "neutral", "neutral"),
+                ])
+                if sells_present:
+                    metrics.append(
+                        ("Sell transactions",
+                            str(actual_res["n_sells"]),
+                            str(alt_res["n_sells"]),
+                            "neutral", "neutral"),
+                    )
+                metrics.extend([
+                    ("Transactions skipped (no NAV)",
+                        str(actual_res["skipped"]),
+                        str(alt_res["skipped"]),
+                        "neutral", "neutral"),
+                    ("Current NAV",
+                        actual_nav_str,
+                        f"₹{alt_res['current_nav']:,.4f}",
+                        "neutral", "neutral"),
+                    ("Remaining Units" if sells_present else "Total Units",
+                        f"{actual_res['total_units']:,.4f}",
+                        f"{alt_res['total_units']:,.4f}",
+                        "neutral", "neutral"),
+                    ("Current Value",
+                        f"₹{actual_res['current_value']:,.0f}",
+                        f"₹{alt_res['current_value']:,.0f}",
+                        cv_a, cv_b),
+                ])
+                if sells_present:
+                    metrics.append(
+                        ("Total Proceeds (current + sold)",
+                            f"₹{actual_res['total_proceeds']:,.0f}",
+                            f"₹{alt_res['total_proceeds']:,.0f}",
+                            pr_a, pr_b),
+                    )
+                metrics.extend([
+                    ("Absolute Return",
+                        f"₹{actual_res['absolute_ret']:,.0f}",
+                        f"₹{alt_res['absolute_ret']:,.0f}",
+                        cv_a, cv_b),
+                    ("Total Return %",
+                        f"{actual_res['return_pct']:+.2f}%",
+                        f"{alt_res['return_pct']:+.2f}%",
+                        ret_a, ret_b),
+                    ("XIRR", xi_a, xi_b, xi_cls_a, xi_cls_b),
+                ])
+
+                rows_html = ""
+                for label, a_val, b_val, cls_a, cls_b in metrics:
+                    rows_html += (
+                        f"<tr>"
+                        f"<td class='metric-col'>{label}</td>"
+                        f"<td class='{cls_a}'>{a_val}</td>"
+                        f"<td class='{cls_b}'>{b_val}</td>"
+                        f"</tr>"
+                    )
+
+                st.markdown(f"""
+                <table class="summary-table">
+                  <thead><tr>
+                    <th style="width:30%">Metric</th>
+                    <th>{a_col_hdr}</th>
+                    <th class="winner-col">{b_col_hdr}</th>
+                  </tr></thead>
+                  <tbody>{rows_html}</tbody>
+                </table>
+                """, unsafe_allow_html=True)
+
+                # ── Transaction-level table (row-level join) ──────────────────
+                st.markdown('<div class="step-label" style="margin-top:2rem">Transaction Detail</div>', unsafe_allow_html=True)
+
+                d_actual = actual_res["detail"].reset_index(drop=True).rename(
+                    columns={"nav": "actual_nav", "units": "actual_units", "status": "actual_status"}
+                )
+                d_alt = alt_res["detail"].reset_index(drop=True).rename(
+                    columns={"nav": "alt_nav", "units": "alt_units", "status": "alt_status"}
+                )
+                # Both came from pooled_txns iterated row-by-row, so positions align 1:1.
+                merged = pd.concat(
+                    [
+                        d_actual[["date", "fund", "direction", "amount", "actual_nav", "actual_units", "actual_status"]],
+                        d_alt[["alt_nav", "alt_units", "alt_status"]],
+                    ],
+                    axis=1,
+                ).sort_values("date").reset_index(drop=True)
+
+                def fmt_nav(x):   return f"₹{x:,.4f}" if pd.notna(x) else "—"
+                def fmt_units(x): return f"{x:,.4f}"  if pd.notna(x) else "—"
+                def fmt_amt_signed(amt, direction):
+                    if pd.isna(amt):
+                        return "—"
+                    if direction == "sell":
+                        return f"−₹{abs(amt):,.0f}"
+                    return f"₹{amt:,.0f}"
+                def fmt_status(actual_s, alt_s):
+                    parts = []
+                    if actual_s == "no_nav": parts.append("⚠ no NAV (actual)")
+                    if alt_s    == "no_nav": parts.append("⚠ no NAV (alt)")
+                    return ", ".join(parts) if parts else "✓"
+
+                display = pd.DataFrame({
+                    "Date":         merged["date"].apply(lambda x: x.strftime("%d %b %Y") if hasattr(x, "strftime") else str(x)),
+                    "Fund":         merged["fund"],
+                    "Type":         merged["direction"].astype(str).str.title(),
+                    "Amount":       [fmt_amt_signed(a, d) for a, d in zip(merged["amount"], merged["direction"])],
+                    "Actual NAV":   merged["actual_nav"].apply(fmt_nav),
+                    "Actual Units": merged["actual_units"].apply(fmt_units),
+                    "Alt NAV":      merged["alt_nav"].apply(fmt_nav),
+                    "Alt Units":    merged["alt_units"].apply(fmt_units),
+                    "Notes":        merged.apply(
+                        lambda r: fmt_status(r.get("actual_status"), r.get("alt_status")), axis=1
+                    ),
+                })
+
+                missing_actual = (merged["actual_status"] == "no_nav").sum()
+                missing_alt    = (merged["alt_status"]    == "no_nav").sum()
+                if missing_actual or missing_alt:
+                    st.markdown(
+                        f'<div class="box box-yellow">'
+                        f'Missing NAV data → Actual: <strong>{missing_actual}</strong> rows, '
+                        f'Alternate: <strong>{missing_alt}</strong> rows. '
+                        f'These rows are excluded from XIRR and return calculations.</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                st.dataframe(display, use_container_width=True, hide_index=True)
+
+                # ── Excel export ──────────────────────────────────────────────
+                st.markdown('<div class="step-label">Export</div>', unsafe_allow_html=True)
+
+                summary_df = pd.DataFrame([
+                    {"Metric": m[0], "Actual": m[1], "Alternate": m[2]}
+                    for m in metrics
+                ])
+                export_df = display.copy()
+
+                buf = io.BytesIO()
+                with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                    summary_df.to_excel(w, sheet_name="Summary",     index=False)
+                    export_df.to_excel(w,  sheet_name="Transactions", index=False)
+                buf.seek(0)
+                st.download_button(
+                    "⬇ Download Excel Report",
+                    data=buf,
+                    file_name=f"mf_compare_{date.today().isoformat()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
 
 # ─── Empty state ─────────────────────────────────────────────────────────────
-if not uploaded:
+if not uploaded_files:
     st.markdown("""
     <div class="box box-yellow">
     <strong>Export from Zerodha Coin:</strong>
