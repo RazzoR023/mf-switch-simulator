@@ -4,58 +4,54 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Activate the virtualenv before running anything:
-
 ```bash
-# Windows (this dev environment)
-venv\Scripts\activate
+pip install -r requirements.txt          # openpyxl (Excel), pyarrow (refresh job only)
+python -m mfsim.refresh [--force]        # build/refresh data/mfsim.sqlite from upstream
+python -m mfsim.server                   # API + built UI on :8501 (DATA_DIR, WEB_DIR, PORT env vars)
+python -m unittest discover -s tests     # unit tests, no network
 
-# macOS/Linux
-source venv/bin/activate
+cd web && npm install
+npm run dev                              # UI on :5173, proxies /api to :8501
+npm run build                            # type-check + build to web/dist (served by mfsim.server)
 ```
 
-Common commands:
-
-- Install deps: `pip install -r requirements.txt`
-- Run the app: `streamlit run app.py` (serves on http://localhost:8501)
-- Force a fresh data download: delete `fund_list.csv` and/or `nav_history.parquet` — the app re-downloads anything older than 23 hours (`MAX_AGE_H` in [app.py](app.py))
-
-There is no test suite, linter, or build step — this is a single-file Streamlit app.
+`docker build .` produces one image that runs either `python -m mfsim.server` (the default) or `python -m mfsim.refresh`.
 
 ## Architecture
 
-The entire app lives in [app.py](app.py). The flow is a strict linear pipeline driven by Streamlit's top-to-bottom re-execution model — each UI step gates the next via `if` checks on prior state (`purchases_df`, `selected_fund`, `actual_code`, `alt_code`).
+A Python server (standard library only: `http.server`, `sqlite3`) plus a React/Mantine UI in `web/`. The split is deliberate: **all logic lives in Python** (parsing, matching, the comparison maths, the Excel report), and the UI only presents what the API returns and formats numbers. Keep new features in that shape. The server is stateless: the browser holds the parsed transactions and posts them back with each `/api/compare` or `/api/report` call.
+
+Keep the runtime lean: the server process must not import pandas, numpy, scipy or pyarrow. Low RAM (~15 MB idle) is the point of this design. openpyxl is imported lazily, only for `.xlsx` uploads and the report.
 
 ### Data layer
 
-NAV data is **not** fetched from an API at runtime. Two files are downloaded once from the [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) GitHub repo and cached locally:
+`mfsim/refresh.py` downloads two upstream files from [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) (fund list CSV ~5 MB, NAV parquet ~150 MB). It builds `data/mfsim.sqlite.new` and `os.replace`s it over the live DB, so readers never see a partial file and a failed run keeps the old one. It skips work when both ETags are unchanged and refuses a result with implausibly few rows.
 
-- `fund_list.csv` (~5 MB) — scheme metadata: scheme code, scheme name, AMC, ISIN, latest NAV date
-- `nav_history.parquet` (~100–200 MB) — full historical NAV time series for ~16k schemes
+Tables:
+- `nav (code, day, nav)`, `WITHOUT ROWID` with primary key `(code, day)`. One scheme's history is one contiguous range read. `day` = days since 1970-01-01.
+- `funds`: one row per scheme code, with NAV range, count and last NAV precomputed.
+- `isins (isin, col_rank, row_rank, code)`: clustered for one-descent ISIN lookups. The ordering reproduces the old app's "first ISIN column, then first row" matching.
+- `funds_fts`: an FTS5 trigram index over the name columns. Search ANDs every query word as a substring. Words under 3 characters fall back to `LIKE` because trigrams can't match them.
 
-`load_data()` is wrapped in `@st.cache_resource` so it runs once per Streamlit process. It builds a `dict[scheme_code -> pd.Series(nav, index=DatetimeIndex)]` (`nav_index`) and **deletes the source DataFrame** to cut steady-state memory roughly in half (~500 MB instead of ~1 GB peak). All NAV lookups go through `nav_on_or_before()` which uses `pd.Series.asof()` for O(log n) date-based lookup against the sorted index — do not replace this with linear scans.
+The upstream schema isn't stable, so column names are matched fuzzily (`_match_fund_columns`, `_match_nav_columns`), first match wins. Preserve that when adding columns.
 
-Column names from the upstream files are normalised to snake_case via fuzzy matching (e.g. `Scheme_Code`, `scheme code`, `Code` all map to `scheme_code`). Preserve this pattern when adding new columns — the upstream schema is not stable.
+`db.Db` opens a fresh read-only connection per request, so a swapped-in database is picked up without a restart. `NavSeries.on_or_before()` is a binary search (`bisect`). Don't replace it with a scan.
 
 ### Tradebook parsing
 
-`parse_zerodha()` has two paths:
+`tradebook.parse_file()` has two paths:
 
-1. **Zerodha Coin CSV tradebook** — detected by the exact column set `{symbol, trade_date, quantity, price, trade_type}`. This is the happy path; columns are mapped directly with no guessing. ISIN is preserved here and is what powers auto-matching in Step 3.
-2. **Legacy Excel exports** — fuzzy column detection fallback with header-row autodetection.
+1. **Zerodha Coin tradebook**, detected by the exact column set `{symbol, trade_date, quantity, price, trade_type}`. Columns are mapped directly; the ISIN is kept and powers auto-matching.
+2. **Fuzzy fallback** for other CSV/XLSX exports: header-row detection for Excel, keyword-based buy/sell detection, day-first dates.
 
-When extending parser support, prefer adding another exact-match branch over loosening the fuzzy fallback.
-
-### Fund matching
-
-Step 3 of the UI tries to auto-match the user's fund to the AMFI database via ISIN before falling back to manual search. The ISIN comes from the Zerodha CSV; the lookup checks every column in `fund_df` whose name contains "isin" (the upstream uses both `isin` and `ISIN_Div_Payout/Growth`-style columns). Manual search via `search_funds()` is a substring AND-match across whitespace-split tokens.
+When extending parser support, prefer adding another exact-match branch over loosening the fuzzy fallback. `dedupe()` removes rows repeated across files, by `trade_id` when every row has one.
 
 ### Finance
 
-`xirr()` uses `scipy.optimize.brentq` with bounds `[-0.9999, 50.0]`. Returns `None` (not raises) when cashflows have no sign change or the solver fails — callers must handle `None`.
+`finance.xirr()` is a port of `scipy.optimize.brentq` (same tolerances) over `[-0.9999, 50.0]`. It returns `None`, not an exception, when cashflows have no sign change or there's no root, so callers must handle `None`.
 
-`compute_scenario()` is the core comparison primitive: given purchases + a NAV series + current NAV, it returns invested/units/current value/XIRR plus a per-row `detail` DataFrame with `status ∈ {"ok", "no_nav"}`. Rows with `no_nav` (purchase predates fund launch) are excluded from totals but kept for the transaction-detail UI.
+`compare.compute_scenario()` replays transactions in the alternate fund. `compute_scenario_pooled()` replays them in each fund actually bought. Buys add units (cash in), sells remove units (cash out). Rows before a fund's first NAV get `status="no_nav"`: they're kept in the detail table and left out of totals and XIRR. Alternate-side units may go negative when a sell exceeds what the alternate was worth; those show up in `negative_events`. `compare.run()` assembles everything the results screen shows (metrics, verdict, detail).
 
-### Styling
+### UI
 
-A single `<style>` block at the top of [app.py](app.py) defines an IBM Plex–based design system with CSS custom properties. UI sections use `box-{blue,yellow,green,red}` for callouts and `step-label` for section headers. Prefer editing these classes over adding inline styles.
+`web/src/App.tsx` holds the step-by-step state: upload → pick funds → match → alternate → run. Components live in `web/src/components/`, number formatting in `web/src/format.ts` (en-IN grouping), and the API types in `web/src/types.ts`. Keep those types in sync with what `compare.py` and `server.py` return. The theme (`web/src/theme.ts`) keeps the original IBM Plex look, with the fonts self-hosted via @fontsource.

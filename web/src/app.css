@@ -1,0 +1,46 @@
+/* The few styles Mantine props don't cover. Colours come from Mantine's variables so both
+   colour schemes work. */
+
+:root[data-mantine-color-scheme='light'] body {
+  background: #f7f6f3;
+}
+
+.page-header {
+  border-bottom: 2px solid var(--mantine-color-text);
+  padding-bottom: 1.1rem;
+}
+
+/* Small uppercase mono labels above each step, as in the original app. */
+.step-label {
+  font-family: var(--mantine-font-family-monospace);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--mantine-color-dimmed);
+  border-bottom: 1px solid var(--mantine-color-default-border);
+  padding-bottom: 0.35rem;
+  margin-bottom: 0.9rem;
+}
+
+.mono {
+  font-family: var(--mantine-font-family-monospace);
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.better {
+  color: var(--mantine-color-green-text);
+  font-weight: 600;
+}
+
+.worse {
+  color: var(--mantine-color-red-text);
+  font-weight: 600;
+}
+
+.winner-col {
+  background: var(--mantine-color-green-light);
+}

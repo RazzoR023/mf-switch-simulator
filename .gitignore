@@ -1,23 +1,15 @@
-# Auto-downloaded data files (see README — fetched on first run)
-fund_list.csv
-nav_history.parquet
+# NAV database built by `python -m mfsim.refresh` (see README)
+data/
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Virtual environments
 venv/
 .venv/
-env/
 
-# Streamlit
-.streamlit/secrets.toml
+# Frontend
+web/node_modules/
+web/dist/
 
 # Editors / OS
 .vscode/

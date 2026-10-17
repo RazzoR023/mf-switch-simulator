@@ -1,155 +1,103 @@
 # MF Switch Simulator
 
-A self-hosted Streamlit app that answers one question: **"What would my returns have been if I had invested in a different mutual fund?"**
+A self-hosted web app that answers one question: **"What would my returns have been if I had invested in a different mutual fund?"**
 
-Upload your Zerodha Coin tradebook, pick an alternate fund, and get a side-by-side XIRR and returns comparison — using your real purchase dates and amounts replayed against the alternate fund's historical NAV.
+Upload your Zerodha Coin tradebook, pick an alternate fund, and get a side-by-side XIRR and returns comparison. Your real purchase and sale dates and amounts are replayed against the alternate fund's historical NAV.
 
-All NAV data is sourced from the [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) GitHub repository and cached locally. No external API calls at runtime.
+NAV data comes from the [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) GitHub repository. A refresh job downloads it once a day into a local SQLite database. Comparisons don't call any external API.
 
 ---
 
 ## Features
 
-- Parses Zerodha Coin CSV tradebook (direct column mapping, no guessing)
-- Auto-matches your fund to AMFI database via ISIN — no manual lookup needed
-- Shows alternate fund NAV data availability range and flags missing dates
-- Computes XIRR and total returns for both actual and hypothetical scenarios
-- Side-by-side comparison table with green/red highlighting
-- Transaction-level detail with missing NAV warnings per row
-- Exports a full Excel report (Summary + Transactions sheets)
-- NAV database auto-refreshes daily from GitHub; shows actual data freshness from `Latest_NAV_Date`
+- Parses Zerodha Coin CSV tradebooks (direct column mapping), with a fuzzy fallback for other CSV/Excel exports
+- Combines several statements, dropping rows that appear in more than one file
+- Clubs several funds into one "actual" portfolio
+- Auto-matches each fund to the AMFI scheme list by ISIN, with a searchable manual override
+- Includes sells: they're cash out on both sides, and only remaining units count towards today's value. A toggle treats every bought unit as still held instead.
+- Shows the alternate fund's NAV range and flags transactions that predate it
+- Side-by-side summary (XIRR, returns, current value), per-transaction detail and an Excel report
+- Light and dark mode, works on a phone
+
+## How it's built
+
+```
+browser ── React + Mantine UI (web/, built to static files)
+   │  JSON
+   ▼
+python -m mfsim.server ── standard library only (http.server + sqlite3), openpyxl for Excel
+   │  read-only
+   ▼
+data/mfsim.sqlite  ◄── python -m mfsim.refresh (daily; the only part that needs pyarrow)
+```
+
+The UI only presents: parsing, matching, the comparison maths and the Excel report all run in Python. The server keeps no per-user state, because the browser sends the parsed transactions back with each request. It idles at about 15 MB of RAM. The old Streamlit version held the full 22M-row NAV history in memory, about 600 MB.
+
+| Path | What it is |
+|---|---|
+| `mfsim/refresh.py` | Downloads the fund list CSV and NAV parquet, builds `data/mfsim.sqlite`, swaps it in atomically. It skips the work when the upstream ETags haven't changed. |
+| `mfsim/db.py` | Read-only queries: fund search, ISIN match, NAV series |
+| `mfsim/tradebook.py` | Statement parsing and cross-file de-duplication |
+| `mfsim/finance.py` | XIRR, using a port of scipy's Brent solver so results match the old app |
+| `mfsim/compare.py` | The comparison and everything the results screen shows |
+| `mfsim/report.py` | The Excel report |
+| `mfsim/server.py` | The HTTP API, and serves the built UI |
+| `web/` | The React app (Vite, TypeScript, Mantine) |
 
 ---
 
-## Prerequisites
+## Running it
 
-Before you begin, make sure you have the following installed on your machine:
+### With Docker
 
-### 1. Python 3.11 or higher
-
-Check if you have it:
 ```bash
-python3 --version
+docker build -t mfsim .
+docker run -d --name mfsim -p 8501:8501 -v "$PWD/data:/data" mfsim
+docker exec mfsim python -m mfsim.refresh     # first time: builds data/mfsim.sqlite (~2 min, ~450 MB)
 ```
 
-If not, download it from [python.org/downloads](https://www.python.org/downloads/). During installation on Windows, check **"Add Python to PATH"**.
+Open http://localhost:8501. Run the refresh again, by hand or on a schedule, to pick up new NAVs.
 
-### 2. pip (Python package manager)
+### For development
 
-pip comes bundled with Python. Verify it works:
-```bash
-pip --version
-```
-
----
-
-## Installation
-
-### Step 1 — Clone the repository
+Needs Python 3.11+ and Node 22+.
 
 ```bash
-git clone https://github.com/your-username/mf-switch-simulator.git
-cd mf-switch-simulator
-```
-
-### Step 2 — (Recommended) Create a virtual environment
-
-This keeps the app's dependencies isolated from your system Python.
-
-```bash
-# Create the environment
-python3 -m venv venv
-
-# Activate it
-# On macOS/Linux:
-source venv/bin/activate
-
-# On Windows:
-venv\Scripts\activate
-```
-
-You'll see `(venv)` appear in your terminal prompt when it's active.
-
-### Step 3 — Install dependencies
-
-```bash
+python -m venv venv && source venv/bin/activate     # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+python -m mfsim.refresh                              # builds data/mfsim.sqlite
+python -m mfsim.server                               # API (and built UI) on :8501
+
+cd web && npm install && npm run dev                 # UI with hot reload on :5173, /api proxied to :8501
 ```
 
-This installs Streamlit, pandas, scipy, and the other required libraries. It may take a minute or two.
+Tests: `python -m unittest discover -s tests`. Type-check the UI: `cd web && npm run typecheck`.
 
 ---
 
-## Running the App
-
-```bash
-streamlit run app.py
-```
-
-Streamlit will start a local web server and open the app in your browser automatically. If it doesn't, navigate to:
-
-```
-http://localhost:8501
-```
-
-### First run
-
-On first launch, the app will download two files from GitHub:
-
-| File | Size | Purpose |
-|---|---|---|
-| `fund_list.csv` | ~5 MB | Fund metadata, scheme codes, ISINs |
-| `nav_history.parquet` | ~100–200 MB | Full historical NAV for all funds |
-
-This is a one-time download. Subsequent startups use the cached files and complete in a few seconds. The data refreshes automatically if the cached files are older than 23 hours.
-
-> **RAM usage:** Loading the NAV history into memory requires approximately **500–600 MB RAM** at steady state, with a peak of ~1 GB during startup. Ensure your machine has at least 2 GB of available RAM.
-
----
-
-## Exporting Your Tradebook from Zerodha Coin
+## Exporting your tradebook from Zerodha Coin
 
 1. Log in to [coin.zerodha.com](https://coin.zerodha.com)
-2. Go to **Portfolio** → **Transaction History** (or **Orders**)
-3. Click **Download** and select **CSV**
-4. The file will be named something like `tradebook-XXXXXX-MF.csv`
-
-Upload this file directly in the app.
+2. Go to **Portfolio** → **Transaction History**
+3. Click **Download** and choose **CSV**
+4. Upload the file (named like `tradebook-XXXXXX-MF.csv`) in the app
 
 ---
 
-## Project Structure
-
-```
-mf-switch-simulator/
-├── app.py               # Main Streamlit application
-├── requirements.txt     # Python dependencies
-├── README.md            # This file
-├── fund_list.csv        # Auto-downloaded on first run (gitignored)
-└── nav_history.parquet  # Auto-downloaded on first run (gitignored)
-```
-
-Add the following to your `.gitignore` to avoid committing the large data files:
-
-```
-fund_list.csv
-nav_history.parquet
-```
-
----
-
-## Data Sources
+## Data sources
 
 | Source | What it provides |
 |---|---|
-| [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) | Daily NAV history + fund metadata for 16,000+ Indian MF schemes, updated daily via Kaggle |
-| AMFI (via above) | Scheme codes, ISINs, fund names, launch dates |
+| [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) | Daily NAV history and fund metadata for 16,000+ Indian MF schemes |
+| AMFI (via the above) | Scheme codes, ISINs, fund names, launch dates |
+
+The banner at the top of the app shows the latest NAV date in the data. If the upstream repository stops updating, the banner turns yellow.
 
 ---
 
 ## Disclaimer
 
-This tool is for **informational and analytical purposes only**. Past NAV history is used for simulation — actual returns from a real switch would differ due to exit loads, STT, capital gains tax, and execution timing. This is not investment advice.
+This tool is for **informational and analytical purposes only**. It replays past NAV history; the returns from a real switch would differ because of exit loads, STT, capital gains tax and execution timing. This is not investment advice.
 
 ---
 

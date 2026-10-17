@@ -1,0 +1,10 @@
+.git
+.claude
+data
+docs
+tests
+venv
+.venv
+**/__pycache__
+web/node_modules
+web/dist
