@@ -160,11 +160,31 @@ def _clean(value: str | None) -> str | None:
 
 # ─── Download ────────────────────────────────────────────────────────────────
 
+DOWNLOAD_ATTEMPTS = 4
+# Per connection attempt and per read. GitHub answers from several addresses and one of
+# them can be unreachable from a given network; urllib tries the addresses in turn, each
+# with the full timeout, so a long one turns a 1 s request into minutes.
+DOWNLOAD_TIMEOUT = 15
+
+
 def _download(url: str, dest: Path, known_etag: str | None) -> str | None:
-    """Stream url to dest. Returns the response's ETag, or None (and writes nothing) when
-    it matches known_etag."""
+    """Stream url to dest, retrying with backoff. Returns the response's ETag, or None (and
+    writes nothing) when it matches known_etag."""
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            return _download_once(url, dest, known_etag)
+        except OSError as e:  # URLError, timeouts and connection resets are all OSErrors
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            wait = 15 * attempt
+            log.warning("%s: %s; retrying in %ds", dest.name, e, wait)
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def _download_once(url: str, dest: Path, known_etag: str | None) -> str | None:
     req = urllib.request.Request(url, headers={"User-Agent": "mfsim-refresh"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
         etag = resp.headers.get("ETag")
         if known_etag and etag == known_etag:
             log.info("%s unchanged (ETag %s)", dest.name, etag)

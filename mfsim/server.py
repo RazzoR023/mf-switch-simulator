@@ -13,6 +13,7 @@ import gzip
 import json
 import logging
 import mimetypes
+import signal
 import sys
 import traceback
 from datetime import date
@@ -266,6 +267,13 @@ def main() -> int:
     server.daemon_threads = True
     log.info("serving on http://%s:%d (data %s, UI %s)", config.HOST, config.PORT,
              config.DB_PATH, config.WEB_DIR)
+
+    # As PID 1 in a container, SIGTERM is ignored unless handled, and `docker stop` would
+    # wait out its 10 s timeout.
+    def stop(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
