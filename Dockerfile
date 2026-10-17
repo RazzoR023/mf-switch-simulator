@@ -1,5 +1,5 @@
 # One image for both jobs: the web server (python -m mfsim.server) and the daily data
-# refresh (python -m mfsim.refresh), which is the only part that needs pyarrow.
+# refresh (python -m mfsim.refresh), which is the only part that needs zstandard.
 
 FROM node:22-alpine AS web
 WORKDIR /web
@@ -15,6 +15,7 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DATA_DIR=/data \
+    STATE_DIR=/state \
     WEB_DIR=/app/web \
     PORT=8501
 WORKDIR /app

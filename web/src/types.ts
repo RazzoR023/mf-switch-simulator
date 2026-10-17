@@ -38,7 +38,27 @@ export interface Transaction {
   trade_id?: string;
 }
 
-export interface FileResult {
+export interface User {
+  username: string;
+}
+
+export interface Me {
+  user: User | null;
+  signup: boolean;
+}
+
+/** One stored statement file (its parsed rows are merged into Portfolio.transactions). */
+export interface UploadFile {
+  id: number;
+  name: string;
+  size: number;
+  uploaded_at: string;
+  count: number;
+  warnings: string[];
+}
+
+/** What happened to each file in an upload. ok=false: not stored (error says why). */
+export interface UploadResult {
   name: string;
   ok: boolean;
   count: number;
@@ -54,14 +74,19 @@ export interface StatementFund {
   n_txns: number;
   n_buys: number;
   n_sells: number;
+  bought: number;
+  sold: number;
   first_date: string;
   last_date: string;
+  /** The user's own pick if they made one, else the ISIN match. */
   match: Fund | null;
+  match_source: 'isin' | 'user' | null;
   match_problem: MatchProblem | null;
 }
 
-export interface TradebookResult {
-  files: FileResult[];
+/** Everything the user has uploaded, deduplicated across files. */
+export interface Portfolio {
+  files: UploadFile[];
   transactions: Transaction[];
   duplicates: { dropped: number; method: string };
   funds: StatementFund[];
@@ -140,10 +165,28 @@ export interface Comparison {
   missing: { actual: number; alternate: number };
 }
 
+/** The server replays the user's stored transactions; funds are matched server-side. */
 export interface CompareRequest {
-  transactions: Transaction[];
   funds: string[];
-  actual_codes: Record<string, number>;
   alt_code: number;
   exclude_sells: boolean;
+}
+
+export interface SavedComparison {
+  id: number;
+  name: string;
+  created_at: string;
+  params: CompareRequest;
+  snapshot: {
+    as_of: string;
+    actual_label: string;
+    alt_label: string;
+    actual_value: number;
+    alt_value: number;
+    actual_xirr: number | null;
+    alt_xirr: number | null;
+    value_diff: number;
+    xirr_diff: number;
+    n_txns: number;
+  };
 }

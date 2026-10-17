@@ -1,34 +1,35 @@
 /* The few styles Mantine props don't cover. Colours come from Mantine's variables so both
    colour schemes work. */
 
-:root[data-mantine-color-scheme='light'] body {
-  background: #f7f6f3;
+body {
+  font-feature-settings: 'cv11', 'ss01';
 }
 
-.page-header {
-  border-bottom: 2px solid var(--mantine-color-text);
-  padding-bottom: 1.1rem;
+/* Cards sit on a slightly tinted page in light mode. */
+:root[data-mantine-color-scheme='light'] .app-main,
+:root[data-mantine-color-scheme='light'] .login-page {
+  background: var(--mantine-color-gray-0);
 }
 
-/* Small uppercase mono labels above each step, as in the original app. */
-.step-label {
-  font-family: var(--mantine-font-family-monospace);
-  font-size: 0.7rem;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--mantine-color-dimmed);
-  border-bottom: 1px solid var(--mantine-color-default-border);
-  padding-bottom: 0.35rem;
-  margin-bottom: 0.9rem;
-}
-
-.mono {
-  font-family: var(--mantine-font-family-monospace);
+.login-page {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: var(--mantine-spacing-md);
+  background-image: radial-gradient(
+    circle at 20% 0%,
+    var(--mantine-color-accent-light) 0%,
+    transparent 45%
+  );
 }
 
 .num {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.mono {
+  font-family: var(--mantine-font-family-monospace);
 }
 
 .better {
@@ -41,6 +42,24 @@
   font-weight: 600;
 }
 
-.winner-col {
-  background: var(--mantine-color-green-light);
+.stat-label {
+  font-size: var(--mantine-font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--mantine-color-dimmed);
+}
+
+.winner {
+  border-color: var(--mantine-color-green-filled);
+  box-shadow: 0 0 0 1px var(--mantine-color-green-filled);
+}
+
+.sticky-setup {
+  position: sticky;
+  top: calc(var(--app-shell-header-height, 60px) + var(--mantine-spacing-md));
+}
+
+.nav-link {
+  border-radius: var(--mantine-radius-md);
 }

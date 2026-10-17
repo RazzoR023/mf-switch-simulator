@@ -8,6 +8,11 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
 DB_PATH = DATA_DIR / "mfsim.sqlite"
 
+# Accounts, sessions, uploaded statements and saved comparisons. Kept apart from DATA_DIR,
+# which the server mounts read-only and the refresh job replaces wholesale.
+STATE_DIR = Path(os.environ.get("STATE_DIR", ROOT / "state"))
+USERS_DB_PATH = STATE_DIR / "users.sqlite"
+
 # The React build. In the Docker image it's copied next to the package.
 WEB_DIR = Path(os.environ.get("WEB_DIR", ROOT / "web" / "dist"))
 
@@ -32,3 +37,8 @@ TOPUP_MONTHS = int(os.environ.get("TOPUP_MONTHS", "3"))
 
 # Largest request body the API accepts (base64-encoded tradebooks).
 MAX_BODY_BYTES = 25 * 1024 * 1024
+
+# Whether the login page offers "Create account". Accounts can always be managed with
+# python -m mfsim.users.
+ALLOW_SIGNUP = os.environ.get("ALLOW_SIGNUP", "true").lower() in ("1", "true", "yes", "on")
+SESSION_DAYS = int(os.environ.get("SESSION_DAYS", "30"))

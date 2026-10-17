@@ -64,3 +64,22 @@ export function txnBlurb(f: Pick<StatementFund, 'n_txns' | 'n_buys' | 'n_sells'>
 export const fundTitle = (f: Fund) => f.nav_name ?? f.name;
 
 export const truncate = (s: string, max = 55) => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
+
+export const signedMoney = (n: number) => `${n >= 0 ? '+' : '−'}₹${inr0.format(Math.abs(n))}`;
+
+/** "₹12.3L" / "₹1.2Cr" for stat cards. */
+export function compactMoney(n: number): string {
+  const a = Math.abs(n);
+  const sign = n < 0 ? '−' : '';
+  if (a >= 1e7) return `${sign}₹${(a / 1e7).toFixed(2)}Cr`;
+  if (a >= 1e5) return `${sign}₹${(a / 1e5).toFixed(2)}L`;
+  return money(n);
+}
+
+export function fileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+export { plural };

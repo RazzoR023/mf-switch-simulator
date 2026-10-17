@@ -142,6 +142,8 @@ def fund_summaries(db: Db, txns: list[dict]) -> list[dict]:
             "n_txns": len(ftx),
             "n_buys": sum(1 for t in ftx if t.get("direction") == "buy"),
             "n_sells": sum(1 for t in ftx if t.get("direction") == "sell"),
+            "bought": sum(t["amount"] for t in ftx if t.get("direction") == "buy"),
+            "sold": sum(t["amount"] for t in ftx if t.get("direction") == "sell"),
             "first_date": min(dates),
             "last_date": max(dates),
             "match": match,

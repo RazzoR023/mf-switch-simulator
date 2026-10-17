@@ -1,9 +1,13 @@
 """Unit tests: python -m unittest discover -s tests (no network, no real database)."""
 
+import base64
+import http.client
+import json
 import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -12,8 +16,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 TMP = tempfile.mkdtemp(prefix="mfsim-test-")
 os.environ["DATA_DIR"] = TMP
+os.environ["STATE_DIR"] = TMP
 
-from mfsim import compare, config, finance, refresh, tradebook  # noqa: E402
+from mfsim import compare, config, finance, refresh, server, store, tradebook  # noqa: E402
 from mfsim.db import Db, NavSeries, date_to_day  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -216,6 +221,162 @@ class TopUpTests(unittest.TestCase):
         self.files[0]["sha"] = "b2"
         self.assertTrue(refresh.top_up())
         self.assertEqual(len(self.fetched), 2)
+
+
+class ApiTests(unittest.TestCase):
+    """The HTTP API end to end: a real server on a random port, two users."""
+
+    @classmethod
+    def setUpClass(cls):
+        build_db()
+        config.USERS_DB_PATH.unlink(missing_ok=True)
+        store.PBKDF2_ITERATIONS = 1000  # fast hashes for tests
+        store.Store.init()
+        cls.httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.httpd.daemon_threads = True
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.port = cls.httpd.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def call(self, method, path, body=None, cookie=None, headers=None):
+        con = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        hdrs = {"Content-Type": "application/json", **(headers or {})}
+        if cookie:
+            hdrs["Cookie"] = cookie
+        con.request(method, path, json.dumps(body) if body is not None else None, hdrs)
+        res = con.getresponse()
+        data = res.read()
+        set_cookie = res.getheader("Set-Cookie")
+        con.close()
+        ctype = res.getheader("Content-Type") or ""
+        return res.status, (json.loads(data) if "json" in ctype else data), set_cookie
+
+    def signup(self, name):
+        status, body, set_cookie = self.call(
+            "POST", "/api/auth/signup", {"username": name, "password": "correct horse"})
+        self.assertEqual(status, 200, body)
+        self.assertIn("HttpOnly", set_cookie)
+        return set_cookie.split(";")[0]
+
+    @staticmethod
+    def files(*names):
+        return {"files": [{"name": n, "data": base64.b64encode((FIXTURES / n).read_bytes()).decode()}
+                          for n in names]}
+
+    def test_needs_a_login(self):
+        self.assertEqual(self.call("GET", "/api/portfolio")[0], 401)
+        self.assertEqual(self.call("GET", "/api/funds?q=grow")[0], 401)
+        self.assertEqual(self.call("GET", "/api/status")[0], 200)
+        status, body, _ = self.call("GET", "/api/auth/me")
+        self.assertEqual((status, body["user"]), (200, None))
+
+    def test_login_logout_and_bad_passwords(self):
+        cookie = self.signup("carol")
+        self.assertEqual(self.call("GET", "/api/auth/me", cookie=cookie)[1]["user"]["username"], "carol")
+        status, _, _ = self.call("POST", "/api/auth/login", {"username": "carol", "password": "nope nope"})
+        self.assertEqual(status, 401)
+        status, _, _ = self.call("POST", "/api/auth/signup", {"username": "CAROL", "password": "whatever1"})
+        self.assertEqual(status, 400)  # usernames are case-insensitive
+        status, body, set_cookie = self.call(
+            "POST", "/api/auth/login", {"username": "Carol", "password": "correct horse"})
+        self.assertEqual(status, 200)
+        fresh = set_cookie.split(";")[0]
+        _, _, cleared = self.call("POST", "/api/auth/logout", {}, cookie=fresh)
+        self.assertIn("Max-Age=0", cleared)
+        self.assertEqual(self.call("GET", "/api/portfolio", cookie=fresh)[0], 401)
+        self.assertEqual(self.call("GET", "/api/portfolio", cookie=cookie)[0], 200)
+
+    def test_cross_site_writes_are_refused(self):
+        cookie = self.signup("dave")
+        status, _, _ = self.call("POST", "/api/uploads", self.files("tradebook-a.csv"), cookie=cookie,
+                                 headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_refused_body_does_not_leak_into_the_next_request(self):
+        cookie = self.signup("frank")
+        con = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        for path, origin in (("/api/uploads", "https://evil.example"), ("/api/nope", None)):
+            hdrs = {"Content-Type": "application/json", "Cookie": cookie}
+            if origin:
+                hdrs["Origin"] = origin
+            con.request("POST", path, json.dumps(self.files("tradebook-a.csv")), hdrs)
+            res = con.getresponse()
+            res.read()
+            self.assertIn(res.status, (403, 404))
+            # Same connection object: the server must hang up rather than read the
+            # leftover body as the next request (http.client reconnects after a close).
+            con.request("GET", "/api/portfolio", headers={"Cookie": cookie})
+            res = con.getresponse()
+            res.read()
+            self.assertEqual(res.status, 200)
+        con.close()
+
+    def test_uploads_matches_and_saved_comparisons(self):
+        alice, bob = self.signup("alice"), self.signup("bob")
+
+        status, body, _ = self.call("POST", "/api/uploads",
+                                    self.files("tradebook-a.csv", "tradebook-b.csv"), cookie=alice)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(all(r["ok"] for r in body["results"]))
+        pf = body["portfolio"]
+        self.assertEqual((len(pf["transactions"]), pf["duplicates"]["dropped"]), (62, 10))
+        self.assertEqual(len(pf["files"]), 2)
+        self.assertNotIn("txns", pf["files"][0])
+
+        # The same file again is refused, and nothing changes.
+        _, body, _ = self.call("POST", "/api/uploads", self.files("tradebook-a.csv"), cookie=alice)
+        self.assertEqual([r["ok"] for r in body["results"]], [False])
+        self.assertEqual(len(body["portfolio"]["files"]), 2)
+
+        # Bob sees none of it and can't touch it.
+        self.assertEqual(self.call("GET", "/api/portfolio", cookie=bob)[1]["transactions"], [])
+        upload_id = pf["files"][0]["id"]
+        self.assertEqual(self.call("DELETE", f"/api/uploads/{upload_id}", cookie=bob)[0], 404)
+        self.assertEqual(self.call("GET", f"/api/uploads/{upload_id}/file", cookie=bob)[0], 404)
+        status, data, _ = self.call("GET", f"/api/uploads/{upload_id}/file", cookie=alice)
+        self.assertEqual(data, (FIXTURES / "tradebook-a.csv").read_bytes())
+
+        # The fixture ISINs aren't in the test database: match one fund by hand.
+        fund = pf["funds"][0]["name"]
+        self.assertIsNone(pf["funds"][0]["match"])
+        status, pf, _ = self.call("POST", "/api/matches", {"fund": fund, "code": 2}, cookie=alice)
+        self.assertEqual(status, 200, pf)
+        mine = next(f for f in pf["funds"] if f["name"] == fund)
+        self.assertEqual((mine["match"]["code"], mine["match_source"]), (2, "user"))
+        self.assertEqual(self.call("POST", "/api/matches", {"fund": fund, "code": 999}, cookie=alice)[0], 400)
+
+        req = {"funds": [fund], "alt_code": 1, "exclude_sells": False}
+        status, res, _ = self.call("POST", "/api/compare", req, cookie=alice)
+        self.assertEqual(status, 200, res)
+        self.assertEqual(res["funds"], [fund])
+        self.assertEqual(self.call("POST", "/api/compare", req, cookie=bob)[0], 400)
+        status, xlsx, _ = self.call("POST", "/api/report", req, cookie=alice)
+        self.assertEqual((status, xlsx[:2]), (200, b"PK"))
+
+        status, body, _ = self.call("POST", "/api/scenarios", {**req, "name": "Try growing"}, cookie=alice)
+        self.assertEqual(status, 200, body)
+        [saved] = body["scenarios"]
+        self.assertEqual((saved["name"], saved["params"]), ("Try growing", req))
+        self.assertAlmostEqual(saved["snapshot"]["value_diff"], res["verdict"]["value_diff"])
+        self.assertEqual(self.call("GET", "/api/scenarios", cookie=bob)[1]["scenarios"], [])
+        self.assertEqual(self.call("DELETE", f"/api/scenarios/{saved['id']}", cookie=bob)[0], 404)
+        _, body, _ = self.call("DELETE", f"/api/scenarios/{saved['id']}", cookie=alice)
+        self.assertEqual(body["scenarios"], [])
+
+        _, pf, _ = self.call("DELETE", f"/api/uploads/{upload_id}", cookie=alice)
+        self.assertEqual(len(pf["files"]), 1)
+
+    def test_change_password_signs_out_other_sessions(self):
+        first = self.signup("erin")
+        status, _, set_cookie = self.call(
+            "POST", "/api/auth/password", {"current": "correct horse", "new": "battery staple"}, cookie=first)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.call("GET", "/api/portfolio", cookie=first)[0], 401)
+        self.assertEqual(self.call("GET", "/api/portfolio", cookie=set_cookie.split(";")[0])[0], 200)
 
 
 if __name__ == "__main__":

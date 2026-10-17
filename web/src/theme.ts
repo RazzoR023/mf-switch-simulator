@@ -1,4 +1,4 @@
-import { createTheme, type MantineColorsTuple } from '@mantine/core';
+import { Card, createTheme, Paper, type MantineColorsTuple } from '@mantine/core';
 
 // Built around the original app's accent, #1a56db (index 6).
 const accent: MantineColorsTuple = [
@@ -17,11 +17,15 @@ const accent: MantineColorsTuple = [
 export const theme = createTheme({
   primaryColor: 'accent',
   colors: { accent },
-  fontFamily: "'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif",
-  fontFamilyMonospace: "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace",
+  fontFamily: "'Inter Variable', system-ui, -apple-system, 'Segoe UI', sans-serif",
+  fontFamilyMonospace: "'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace",
   headings: {
-    fontFamily: "'IBM Plex Serif', Georgia, serif",
-    fontWeight: '400',
+    fontFamily: "'Inter Variable', system-ui, sans-serif",
+    fontWeight: '650',
   },
-  defaultRadius: 'sm',
+  defaultRadius: 'md',
+  components: {
+    Card: Card.extend({ defaultProps: { withBorder: true, radius: 'md', padding: 'lg' } }),
+    Paper: Paper.extend({ defaultProps: { radius: 'md' } }),
+  },
 });

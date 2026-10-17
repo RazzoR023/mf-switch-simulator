@@ -6,14 +6,8 @@ import { Notifications } from '@mantine/notifications';
 import '@mantine/core/styles.css';
 import '@mantine/dropzone/styles.css';
 import '@mantine/notifications/styles.css';
-import '@fontsource/ibm-plex-sans/300.css';
-import '@fontsource/ibm-plex-sans/400.css';
-import '@fontsource/ibm-plex-sans/500.css';
-import '@fontsource/ibm-plex-sans/600.css';
-import '@fontsource/ibm-plex-mono/400.css';
-import '@fontsource/ibm-plex-mono/500.css';
-import '@fontsource/ibm-plex-serif/400.css';
-import '@fontsource/ibm-plex-serif/400-italic.css';
+import '@fontsource-variable/inter';
+import '@fontsource-variable/jetbrains-mono';
 import './app.css';
 
 import { App } from './App';

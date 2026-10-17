@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 pip install -r requirements.txt          # openpyxl (Excel), zstandard (refresh job only)
 python -m mfsim.refresh [--full]         # top up data/mfsim.sqlite (or rebuild it from the release)
-python -m mfsim.server                   # API + built UI on :8501 (DATA_DIR, WEB_DIR, PORT env vars)
+python -m mfsim.server                   # API + built UI on :8501 (DATA_DIR, STATE_DIR, WEB_DIR, PORT, ALLOW_SIGNUP)
+python -m mfsim.users list|add|passwd|delete [NAME]   # manage accounts
 python -m unittest discover -s tests     # unit tests, no network
 
 cd web && npm install
@@ -19,7 +20,13 @@ npm run build                            # type-check + build to web/dist (serve
 
 ## Architecture
 
-A Python server (standard library only: `http.server`, `sqlite3`) plus a React/Mantine UI in `web/`. The split is deliberate: **all logic lives in Python** (parsing, matching, the comparison maths, the Excel report), and the UI only presents what the API returns and formats numbers. Keep new features in that shape. The server is stateless: the browser holds the parsed transactions and posts them back with each `/api/compare` or `/api/report` call.
+A Python server (standard library only: `http.server`, `sqlite3`) plus a React/Mantine UI in `web/`. The split is deliberate: **all logic lives in Python** (parsing, matching, the comparison maths, the Excel report), and the UI only presents what the API returns and formats numbers. Keep new features in that shape.
+
+### Accounts and per-user state
+
+`mfsim/store.py` owns `STATE_DIR/users.sqlite`, separate from the NAV database (which the server mounts read-only and the refresh job replaces wholesale). Tables: `users` (PBKDF2-SHA256 hashes; usernames `COLLATE NOCASE`), `sessions` (only the SHA-256 of the cookie token is stored), `uploads` (the original file *and* its parsed rows as JSON, unique per user and file hash), `matches` (a user's own scheme pick per statement fund, overriding the ISIN match) and `scenarios` (saved comparisons: the request params plus a snapshot of the headline figures). Every user-owned row cascades from `users`; every query filters by `user_id`, so keep that in new queries.
+
+`server.py` routes through the `ROUTES` table: (method, path regex, handler, needs login). Handlers take a `Request` (query, body, path params, user) and return a dict, a `Reply` (to set or clear the session cookie) or a `(bytes, content type, filename)` tuple for downloads. `_portfolio()` merges the user's uploads, dedupes them and applies matches; `/api/compare`, `/api/coverage`, `/api/report` and `/api/scenarios` take only `{funds, alt_code, exclude_sells}` and replay the stored transactions. Writes check `Origin` against `Host` (CSRF), and a request body that won't be used is drained (`_drain`) so it can't be read as the next keep-alive request. `python -m mfsim.users` is the admin CLI (there's no admin UI).
 
 Keep the runtime lean: the server process must not import pandas, numpy, scipy or pyarrow. Low RAM (~15 MB idle) is the point of this design. openpyxl is imported lazily, only for `.xlsx` uploads and the report.
 
@@ -55,4 +62,4 @@ When extending parser support, prefer adding another exact-match branch over loo
 
 ### UI
 
-`web/src/App.tsx` holds the step-by-step state: upload → pick funds → match → alternate → run. Components live in `web/src/components/`, number formatting in `web/src/format.ts` (en-IN grouping), and the API types in `web/src/types.ts`. Keep those types in sync with what `compare.py` and `server.py` return. The theme (`web/src/theme.ts`) keeps the original IBM Plex look, with the fonts self-hosted via @fontsource.
+`web/src/App.tsx` shows `pages/Login.tsx` until `/api/auth/me` returns a user, then `Shell.tsx`: a Mantine `AppShell` with hash routes (`#/overview`, `#/statements`, `#/compare`, `#/saved`). `Shell` holds the shared state (portfolio, saved comparisons, the comparison being set up and its result) so it survives page switches; pages live in `web/src/pages/`, shared pieces in `web/src/components/`. Any 401 from the API drops back to the login page (`api.setSignedOutHandler`). Number formatting is in `web/src/format.ts` (en-IN grouping) and the API types in `web/src/types.ts`; keep those types in sync with what `compare.py` and `server.py` return. Fonts (Inter, JetBrains Mono) are self-hosted via @fontsource.
