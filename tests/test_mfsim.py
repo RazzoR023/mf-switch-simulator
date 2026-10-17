@@ -21,6 +21,7 @@ FIXTURES = ROOT / "tests" / "fixtures"
 
 def build_db():
     """Two schemes with daily NAVs over 2020-2023: A grows 10%/yr, B is flat at 10."""
+    config.DB_PATH.unlink(missing_ok=True)
     con = sqlite3.connect(config.DB_PATH)
     con.executescript(refresh.SCHEMA)
     start = date(2020, 1, 1)
@@ -35,13 +36,8 @@ def build_db():
         [(1, "Growing Fund", "Growing Fund - Direct - Growth"), (2, "Flat Fund", "Flat Fund - Direct")],
     )
     con.execute("INSERT INTO isins VALUES ('INF000A01', 0, 0, 1)")
+    refresh._update_fund_stats(con)
     con.executescript(refresh.INDEXES)
-    con.execute(
-        "UPDATE funds SET nav_start = r.s, nav_end = r.e, nav_count = r.n,"
-        " last_nav = (SELECT nav FROM nav WHERE nav.code = funds.code AND nav.day = r.e)"
-        " FROM (SELECT code, MIN(day) s, MAX(day) e, COUNT(*) n FROM nav GROUP BY code) r"
-        " WHERE r.code = funds.code"
-    )
     con.execute("INSERT INTO meta VALUES ('latest_nav_date', '2023-12-30')")
     con.commit()
     con.close()
@@ -88,6 +84,55 @@ class TradebookTests(unittest.TestCase):
     def test_missing_columns_is_a_readable_error(self):
         with self.assertRaises(tradebook.TradebookError):
             tradebook.parse_file("x.csv", b"foo,bar\n1,2\n")
+
+
+DAY_FILE_NEW = """Scheme Code;NAV Name;Plan;Option;ISIN Div Payout/ISIN Growth;ISIN Div Reinvestment;Net Asset Value;Date
+
+Open Ended Schemes ( Equity Scheme - Multi Cap Fund )
+
+
+Aditya Birla Sun Life Mutual Fund
+148921;Aditya Birla Sun Life Multi-Cap Fund-Direct Growth;Direct Plan;GROWTH;INF209KB1Y49;;21.90;16-Oct-2026
+148920;Aditya Birla Sun Life Multi-Cap Fund-Direct IDCW Payout;Direct Plan;IDCW Payout;iinf209kb1y56;INF209KB1Y57;1,018.02;16-Oct-2026
+
+Bajaj Finserv Mutual Fund
+153309;BAJAJ FINSERV MULTI CAP FUND - DIRECT - GROWTH;Direct Plan;Growth;NOTAPP;;N.A.;16-Oct-2026
+"""
+
+DAY_FILE_OLD = """Scheme Code;Scheme Name;ISIN Div Payout/ISIN Growth;ISIN Div Reinvestment;Net Asset Value;Repurchase Price;Sale Price;Date
+
+Close Ended Schemes ( Income )
+
+Some AMC Mutual Fund
+
+100001;Some Income Fund - Growth;INF000X01011;;12.5;;;05-Jan-2010
+"""
+
+
+class DayFileTests(unittest.TestCase):
+    def test_current_format(self):
+        rows, schemes, isins = refresh.parse_day_file(DAY_FILE_NEW, date(2026, 10, 16))
+        day = date_to_day(date(2026, 10, 16))
+        self.assertEqual(rows, [(148921, day, 21.9), (148920, day, 1018.02)])  # N.A. dropped
+        self.assertEqual(
+            schemes[148920],
+            ("Aditya Birla Sun Life Multi-Cap Fund-Direct IDCW Payout",
+             "Aditya Birla Sun Life Mutual Fund", "Equity Scheme - Multi Cap Fund"),
+        )
+        self.assertEqual(schemes[153309][1], "Bajaj Finserv Mutual Fund")
+        # Lowercase and the extra leading I fixed; NOTAPP dropped.
+        self.assertEqual(sorted(isins), [
+            ("INF209KB1Y49", 0, 148921), ("INF209KB1Y56", 0, 148920), ("INF209KB1Y57", 1, 148920),
+        ])
+
+    def test_old_format(self):
+        rows, schemes, isins = refresh.parse_day_file(DAY_FILE_OLD, date(2010, 1, 5))
+        self.assertEqual(rows, [(100001, date_to_day(date(2010, 1, 5)), 12.5)])
+        self.assertEqual(schemes[100001], ("Some Income Fund - Growth", "Some AMC Mutual Fund", "Income"))
+        self.assertEqual(isins, [("INF000X01011", 0, 100001)])
+
+    def test_not_a_day_file(self):
+        self.assertEqual(refresh.parse_day_file("<html>error</html>", date(2026, 1, 1)), ([], {}, []))
 
 
 class CompareTests(unittest.TestCase):
@@ -137,6 +182,40 @@ class CompareTests(unittest.TestCase):
     def test_unmatched_fund_is_an_error(self):
         with Db() as db, self.assertRaises(compare.CompareError):
             compare.run(db, [], ["Mine"], {}, 1, False)
+
+
+class TopUpTests(unittest.TestCase):
+    """top_up() against a throwaway database, with the GitHub calls stubbed out."""
+
+    def setUp(self):
+        build_db()
+        self.addCleanup(lambda: config.DB_PATH.unlink(missing_ok=True))
+        self.files = [{"path": "data/2026/10/16.csv", "sha": "a1", "date": date(2026, 10, 16)}]
+        self.fetched = []
+        self._list, self._get = refresh._list_day_files, refresh._get_bytes
+        refresh._list_day_files = lambda months: list(self.files)
+        refresh._get_bytes = lambda url: self.fetched.append(url) or DAY_FILE_NEW.encode()
+        self.addCleanup(lambda: setattr(refresh, "_list_day_files", self._list))
+        self.addCleanup(lambda: setattr(refresh, "_get_bytes", self._get))
+        refresh.MIN_NAV_ROWS, refresh.MIN_FUNDS_WITH_NAV = 1, 1
+
+    def test_applies_new_files_once(self):
+        self.assertTrue(refresh.top_up())
+        with Db() as db:
+            fund = db.fund(148920)
+            self.assertEqual(fund["amc"], "Aditya Birla Sun Life Mutual Fund")
+            self.assertEqual(fund["nav_end"], "2026-10-16")
+            self.assertEqual(fund["last_nav"], 1018.02)
+            self.assertEqual(db.match_isin("INF209KB1Y57")["code"], 148920)
+            self.assertEqual([f["code"] for f in db.search_funds("multi-cap direct idcw")], [148920])
+            self.assertEqual(db.meta()["latest_nav_date"], "2026-10-16")
+        # Same SHA again: nothing to fetch.
+        self.assertFalse(refresh.top_up())
+        self.assertEqual(len(self.fetched), 1)
+        # A re-published file (new SHA) is fetched again.
+        self.files[0]["sha"] = "b2"
+        self.assertTrue(refresh.top_up())
+        self.assertEqual(len(self.fetched), 2)
 
 
 if __name__ == "__main__":

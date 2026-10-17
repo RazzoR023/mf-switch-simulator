@@ -4,7 +4,7 @@ A self-hosted web app that answers one question: **"What would my returns have b
 
 Upload your Zerodha Coin tradebook, pick an alternate fund, and get a side-by-side XIRR and returns comparison. Your real purchase and sale dates and amounts are replayed against the alternate fund's historical NAV.
 
-NAV data comes from the [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) GitHub repository. A refresh job downloads it once a day into a local SQLite database. Comparisons don't call any external API.
+NAV data is AMFI's official daily NAV export, as archived by [captn3m0/historical-mf-data](https://github.com/captn3m0/historical-mf-data). A refresh job keeps a local SQLite database current: one full download to start, then only each new day's file. Comparisons don't call any external API.
 
 ---
 
@@ -28,14 +28,14 @@ browser ── React + Mantine UI (web/, built to static files)
 python -m mfsim.server ── standard library only (http.server + sqlite3), openpyxl for Excel
    │  read-only
    ▼
-data/mfsim.sqlite  ◄── python -m mfsim.refresh (daily; the only part that needs pyarrow)
+data/mfsim.sqlite  ◄── python -m mfsim.refresh (daily top-up from AMFI day files; monthly full rebuild)
 ```
 
 The UI only presents: parsing, matching, the comparison maths and the Excel report all run in Python. The server keeps no per-user state, because the browser sends the parsed transactions back with each request. It idles at about 15 MB of RAM. The old Streamlit version held the full 22M-row NAV history in memory, about 600 MB.
 
 | Path | What it is |
 |---|---|
-| `mfsim/refresh.py` | Downloads the fund list CSV and NAV parquet, builds `data/mfsim.sqlite`, swaps it in atomically. It skips the work when the upstream ETags haven't changed. |
+| `mfsim/refresh.py` | Full build: downloads the upstream release (`funds.db.zst`, ~380 MB), converts it into `data/mfsim.sqlite` and swaps it in atomically. Daily: applies only new or changed AMFI day files (~1.2 MB each). |
 | `mfsim/db.py` | Read-only queries: fund search, ISIN match, NAV series |
 | `mfsim/tradebook.py` | Statement parsing and cross-file de-duplication |
 | `mfsim/finance.py` | XIRR, using a port of scipy's Brent solver so results match the old app |
@@ -53,7 +53,7 @@ The UI only presents: parsing, matching, the comparison maths and the Excel repo
 ```bash
 docker build -t mfsim .
 docker run -d --name mfsim -p 8501:8501 -v "$PWD/data:/data" mfsim
-docker exec mfsim python -m mfsim.refresh     # first time: builds data/mfsim.sqlite (~2 min, ~450 MB)
+docker exec mfsim python -m mfsim.refresh     # first time: builds data/mfsim.sqlite (~8 min incl. download, ~750 MB)
 ```
 
 Open http://localhost:8501. Run the refresh again, by hand or on a schedule, to pick up new NAVs.
@@ -88,7 +88,7 @@ Tests: `python -m unittest discover -s tests`. Type-check the UI: `cd web && npm
 
 | Source | What it provides |
 |---|---|
-| [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) | Daily NAV history and fund metadata for 16,000+ Indian MF schemes |
+| [AMFI](https://www.amfiindia.com/net-asset-value) via [captn3m0/historical-mf-data](https://github.com/captn3m0/historical-mf-data) | Every NAV AMFI has published since 2006 for ~38,000 scheme codes (closed schemes included), with ISINs, AMC and category |
 | AMFI (via the above) | Scheme codes, ISINs, fund names, launch dates |
 
 The banner at the top of the app shows the latest NAV date in the data. If the upstream repository stops updating, the banner turns yellow.

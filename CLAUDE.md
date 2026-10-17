@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-pip install -r requirements.txt          # openpyxl (Excel), pyarrow (refresh job only)
-python -m mfsim.refresh [--force]        # build/refresh data/mfsim.sqlite from upstream
+pip install -r requirements.txt          # openpyxl (Excel), zstandard (refresh job only)
+python -m mfsim.refresh [--full]         # top up data/mfsim.sqlite (or rebuild it from the release)
 python -m mfsim.server                   # API + built UI on :8501 (DATA_DIR, WEB_DIR, PORT env vars)
 python -m unittest discover -s tests     # unit tests, no network
 
@@ -25,15 +25,16 @@ Keep the runtime lean: the server process must not import pandas, numpy, scipy o
 
 ### Data layer
 
-`mfsim/refresh.py` downloads two upstream files from [InertExpert2911/Mutual_Fund_Data](https://github.com/InertExpert2911/Mutual_Fund_Data) (fund list CSV ~5 MB, NAV parquet ~150 MB). It builds `data/mfsim.sqlite.new` and `os.replace`s it over the live DB, so readers never see a partial file and a failed run keeps the old one. It skips work when both ETags are unchanged and refuses a result with implausibly few rows.
+`mfsim/refresh.py` keeps the database current from [captn3m0/historical-mf-data](https://github.com/captn3m0/historical-mf-data), an archive of AMFI's daily NAV exports (`data/YYYY/MM/DD.csv`, semicolon-separated, with category and AMC section lines between the rows), released daily as one SQLite file (`funds.db.zst`). A **full build** (no database, a `SCHEMA_VERSION` change, every `FULL_REBUILD_DAYS`, or `--full`) downloads the release, copies it into our schema with SQL in `data/mfsim.sqlite.new`, applies the last week of day files and `os.replace`s it over the live DB, so readers never see a partial file and a failed build keeps the old one. A **top-up** (every other run) lists the last `TOPUP_MONTHS` month folders through the GitHub API, downloads only day files whose git SHA isn't in `day_files`, and applies them to the live DB in one transaction. Both refuse a result with implausibly few rows.
 
 Tables:
 - `nav (code, day, nav)`, `WITHOUT ROWID` with primary key `(code, day)`. One scheme's history is one contiguous range read. `day` = days since 1970-01-01.
 - `funds`: one row per scheme code, with NAV range, count and last NAV precomputed.
-- `isins (isin, col_rank, row_rank, code)`: clustered for one-descent ISIN lookups. The ordering reproduces the old app's "first ISIN column, then first row" matching.
+- `isins (isin, col_rank, row_rank, code)`: clustered for one-descent ISIN lookups. `col_rank` 0 = growth/IDCW payout ISIN, 1 = IDCW reinvestment; `row_rank` is always 0 (kept so lookups can order by it).
+- `day_files (path, sha)`: the upstream day files already applied, with the git SHA they had.
 - `funds_fts`: an FTS5 trigram index over the name columns. Search ANDs every query word as a substring. Words under 3 characters fall back to `LIKE` because trigrams can't match them.
 
-The upstream schema isn't stable, so column names are matched fuzzily (`_match_fund_columns`, `_match_nav_columns`), first match wins. Preserve that when adding columns.
+`parse_day_file()` finds columns by header name because AMFI's header changed over the years (older files have `Scheme Name` and repurchase/sale price columns, newer ones `NAV Name`, `Plan`, `Option`). ISINs and NAV values get the same clean-ups the upstream release applies (`clean_isin`, `clean_nav`). AMFI has no separate scheme name, so `funds.name` is the plan-level name and `nav_name` stays NULL; AMC and category exist only for schemes seen in a day file since the last full build.
 
 `db.Db` opens a fresh read-only connection per request, so a swapped-in database is picked up without a restart. `NavSeries.on_or_before()` is a binary search (`bisect`). Don't replace it with a scan.
 
